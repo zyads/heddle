@@ -37,6 +37,7 @@
 //! stored ([`secrets`]); embeddings only ever talk to a loopback Ollama.
 
 pub mod anchor;
+pub mod deadend;
 pub mod embed;
 pub mod index;
 pub mod render;
@@ -110,6 +111,10 @@ pub struct Note {
     pub verified: Vec<Verification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired: Option<Retired>,
+    /// Notes that are one fact pinned to several sites (a dead end that
+    /// touched three functions) share a group id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// What an agent sees of a note: no fingerprints (an anchor's line hashes
@@ -221,6 +226,11 @@ impl Repo {
             return Ok(p.trim_start_matches("./").to_string());
         }
         Err(format!("{p} is not inside {}", self.root.display()))
+    }
+
+    /// `path` as committed at HEAD (not the working tree).
+    pub fn head_content(&self, path: &str) -> Option<String> {
+        self.git(&["show", &format!("HEAD:{path}")]).ok()
     }
 
     /// Current content of `path` in this working tree (falls back to HEAD
@@ -521,6 +531,11 @@ fn file_dirty(repo: &Repo, path: &str) -> bool {
 /// Add a note at `spec`. Refuses secrets, empty text, unknown kinds, and
 /// exact duplicates (same anchor, same text).
 pub fn add(repo: &Repo, spec: &str, text: &str, kind: &str, author: Author) -> Result<Note, String> {
+    add_grouped(repo, spec, text, kind, author, None)
+}
+
+/// [`add`], tagging the note as one site of a multi-site fact.
+pub fn add_grouped(repo: &Repo, spec: &str, text: &str, kind: &str, author: Author, group: Option<String>) -> Result<Note, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("empty note".into());
@@ -547,6 +562,7 @@ pub fn add(repo: &Repo, spec: &str, text: &str, kind: &str, author: Author) -> R
         anchored_at: None,
         verified: vec![],
         retired: None,
+        group,
         author,
         anchor,
     };

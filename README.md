@@ -194,7 +194,7 @@ The tool flow an agent follows:
 Memory tools (work in any git repo, no `heddle init` needed):
 `heddle_gloss_read` (a file with its notes inlined), `heddle_gloss_add`,
 `heddle_gloss_search`, `heddle_gloss_why`, `heddle_gloss_verify`,
-`heddle_gloss_drop`. `heddle_propose` also takes `learned: [{target, text,
+`heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end). `heddle_propose` also takes `learned: [{target, text,
 kind}]`: the moment an agent knows the most is the moment it proposes.
 
 ## Gloss — memory pinned to code
@@ -245,6 +245,41 @@ about to edit. Someone who reads the code then runs `gloss verify <id>`
 (rebaseline it, optionally with corrected text) or `gloss drop <id>` (retire
 it; it stays in `why` and in the history).
 
+### Dead ends: what git throws away
+
+Git keeps what worked. The hour an agent spent learning that an approach
+*doesn't* work is lost when it gives up, so the next agent pays for it again.
+`heddle abandon "<why>"` (MCP: `heddle_abandon`) releases the lease and pins
+the attempt to the symbols the thread actually changed: the goal, the why,
+the last red verify's failing lines, and the date. It shows up first, before
+anything else, when the next agent leases that scope or reads those files:
+
+```console
+$ heddle abandon "a non-atomic wrapping_add loses increments under contention; needs AtomicU64"
+thread thread-…-1 abandoned; lease released
+dead end de5c4ead691 pinned to 1 site(s):
+  gb9f4a2975809 src/cache.rs::Cache::get
+
+# later, a different agent:
+$ heddle lease "count cache hits per key" src/cache.rs
+  ...
+  DEAD ENDS in this scope — tried before, failed:
+    gb9f4a2975809 src/cache.rs::Cache::get (fresh)
+      Tried: make Cache::get lock-free
+      Failed: a non-atomic wrapping_add loses increments under contention; needs AtomicU64
+      Verify `cargo test` was red: test cache::concurrent_get ... FAILED | thread 'concurrent_get' panicked: hits lost under contention
+      Changed: src/cache.rs (Cache::get)
+```
+
+Only symbols whose bodies changed are marked (innermost first; untouched
+neighbors stay clean). New files are named in the text, since there's no
+code in the fabric to pin them to. The verify digest keeps only failure
+lines and drops anything that looks like a secret. A dead end is a gloss
+like any other, so it goes STALE when the code under it changes: "tried
+against older code" is still worth knowing, and it's labeled as such.
+`Abandoned` is a terminal thread state, like `Woven`. Abandoned threads are
+never offered as orphans, and `heddle clean` removes their worktrees.
+
 **Why this beats memory files**
 
 | | CLAUDE.md / memory files | gloss |
@@ -252,6 +287,7 @@ it; it stays in `why` and in the history).
 | knows which code it describes | no | symbol path, line span, content fingerprint |
 | survives refactors | n/a | re-found by symbol, then exact text, then fuzzy match; renamed files are followed |
 | tells you when it's wrong | never | `STALE` the moment the code under it changes; whitespace-only edits don't count |
+| failed approaches | lost with the session | `deadend` notes on the symbols the attempt touched, surfaced at lease time |
 | history | whatever git blame on the .md says | every add/verify/move/drop is a commit on `refs/gloss/notes`; `gloss why` joins notes with `git log -L` |
 | shown where it matters | loaded in full every session | inline above the code, only when that file is read |
 | searchable | grep | BM25 over notes + code; fused with local embeddings when Ollama is up |

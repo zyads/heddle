@@ -144,7 +144,7 @@ fn tools() -> Value {
                 "thread_id": {"type": "string", "description": "Defaults to the thread whose \
                     worktree contains `repo`, else the repo's ONLY live thread; ambiguous \
                     bare calls are refused with the list."},
-                "repo": repo_prop,
+                "repo": repo_prop.clone(),
             }},
         },
         {
@@ -171,6 +171,20 @@ fn tools() -> Value {
                 "thread_id": {"type": "string"},
                 "repo": repo_prop,
             }, "required": ["thread_id"]},
+        },
+        {
+            "name": "heddle_abandon",
+            "description": "Give up on your thread when the approach does not work. The lease is \
+                released and what you tried is pinned to the symbols you changed as a DEAD END \
+                note — goal, your `why`, the last red verify — which the next agent sees first \
+                when it leases that scope or reads those files. Git forgets failed attempts; this \
+                is how the next agent avoids repeating yours. Be specific in `why`: what broke and \
+                what you would try instead.",
+            "inputSchema": {"type": "object", "properties": {
+                "why": {"type": "string", "description": "What failed and why (one to three sentences)."},
+                "thread_id": {"type": "string", "description": "Defaults like heddle_propose."},
+                "repo": repo_prop.clone(),
+            }, "required": ["why"]},
         },
         {
             "name": "heddle_gloss_read",
@@ -324,7 +338,20 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                 .declare_lease_mode(&repo.id, &holder(), goal, scope, criteria, ttl_ms, mode)?;
             solo::set(&engine.base(), &repo.id, &out.lease.id, &out.thread.id);
             let isolated = out.thread.worktree.is_some();
+            let dead_ends: Vec<Value> = gloss::Repo::open(&repo.path)
+                .map(|g| {
+                    gloss::deadend::in_scope(&g, &out.lease.scope)
+                        .iter()
+                        .take(8)
+                        .map(|(n, r)| json!(gloss::NoteView::of(n, r.as_ref())))
+                        .collect()
+                })
+                .unwrap_or_default();
             Ok(json!({
+                "dead_ends": if dead_ends.is_empty() { Value::Null } else { json!({
+                    "read_first": "approaches already tried in this scope that FAILED — do not repeat them blindly",
+                    "notes": dead_ends,
+                }) },
                 "lease": out.lease,
                 "thread": out.thread,
                 "toe_steps": out.toe_steps,
@@ -454,6 +481,25 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
             })
             .to_string())
         }
+        "heddle_abandon" => {
+            let why = arg(args, "why").ok_or("heddle_abandon needs `why` — that sentence is the dead end")?;
+            let (repo, thread_id) = match arg(args, "thread_id") {
+                Some(t) => (repo_of(engine, args)?, t.to_string()),
+                None => {
+                    let (repo, thread) = bare_target(engine, args)?;
+                    (repo, thread.id)
+                }
+            };
+            let out = engine.abandon(&thread_id, why)?;
+            if solo::get(&engine.base(), &repo.id).is_some_and(|p| p.thread_id == thread_id) {
+                solo::clear(&engine.base(), &repo.id);
+            }
+            let recorded = match gloss::deadend::record(engine, &out, why, &holder()) {
+                Ok(r) => json!(r),
+                Err(e) => json!({"not_recorded": e}),
+            };
+            Ok(json!({"thread": out.thread.id, "status": "abandoned", "dead_end": recorded}).to_string())
+        }
         g if g.starts_with("heddle_gloss_") => gloss_call(g, args),
         other => Err(format!("unknown tool: {other}")),
     }
@@ -501,6 +547,12 @@ fn gloss_call(name: &str, args: &Value) -> Result<String, String> {
             let opts = gloss::render::RenderOpts { numbers: true, show_untrusted: !trusted };
             let (text, notes) = gloss::read(&repo, need("path")?, &opts)?;
             let stale = notes.iter().filter(|(_, r)| !r.status.trustworthy()).count();
+            let dead = notes.iter().filter(|(n, _)| n.kind == "deadend").count();
+            let text = if dead > 0 {
+                format!("[{dead} DEAD END note(s) in this file: approaches already tried here that failed. Read them before changing the code they sit on.]\n{text}")
+            } else {
+                text
+            };
             Ok(if stale > 0 {
                 format!("{text}\n[{stale} note(s) above are STALE/ORPHANED: the code changed since they were written. \
                          If you confirm one still holds, heddle_gloss_verify it; if not, heddle_gloss_drop it.]")
