@@ -85,9 +85,9 @@ neighbors and what each does that Heddle doesn't.
 
 ## What it's not for
 
-- **N agents racing the SAME task.** Heddle coordinates *different* tasks on
-  one repo. For redundant attempts at one task, use a judge/tournament
-  harness — then lease the winner's landing.
+- **Running the agents.** Heddle coordinates agents; it doesn't launch
+  them. Even `heddle race` (below) hands you N worktrees and judges the
+  results; you point the agents at them.
 - **Replacing git.** Heddle sits on top; git stays your history, remotes, and
   review tooling. The optional bridge projects each landed weave into local
   git history — one commit per weave by default, checkpoint-level if you ask
@@ -225,6 +225,27 @@ heddle lease "rework sessions"      'src/auth.rs::Session'           # toe-step:
   in-crate). Edits that don't touch merge into the worktree, and the next
   `propose` verifies the merged file. Edits that overlap or touch stay an
   honest conflict.
+
+## Races: N attempts, one winner, failures kept
+
+```bash
+heddle race "make the parser streaming" 'src/parse/**' --n 3   # 3 isolated worktrees, no toe-steps between them
+# point one agent (or model, or prompt) at each worktree; they stitch as usual
+heddle race judge race-f5377bb7ef
+#   thread-…-1  RED     1 changed lines  51 ms  race attempt: verify was red → dead end d167106760a
+#   thread-…-3  green   1 changed lines  51 ms  winner
+#   winner: thread-…-3   (then the usual consent prompt to land it)
+```
+
+The judge verifies every attempt in a scratch copy and decides by facts.
+Green beats red; among greens, the smallest change (changed lines vs
+base) wins; ties go to the fastest verify. **Red losers become dead ends**,
+pinned to the code they changed with their failure digest, so the next
+agent sees the approach failed. **Green losers are retired, not blamed.**
+A working alternative isn't a failed approach, and recording it as one
+would teach the next agent something false. The winner goes back to Active
+and lands only through the normal consent gate, which re-verifies against
+the fabric as it is then.
 
 ## Heat: where agents burn effort
 

@@ -75,6 +75,7 @@ pub mod gloss;
 pub mod heat;
 pub mod lease;
 pub mod merge;
+pub mod race;
 pub mod savings;
 pub mod solo;
 pub mod store;
@@ -234,6 +235,10 @@ pub struct Lease {
     pub holder: String,
     pub ttl_ms: u64,
     pub last_heartbeat_ms: u64,
+    /// Set on the N sibling leases of one `heddle race`: same goal, same
+    /// scope, deliberately parallel — so they never toe-step each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub race: Option<String>,
 }
 
 impl Lease {
@@ -1166,6 +1171,23 @@ impl Heddle {
         ttl_ms: Option<u64>,
         mode: IsolationMode,
     ) -> Result<DeclareOutcome, String> {
+        self.declare_lease_raced(repo_id, holder, goal, scope, criteria, ttl_ms, mode, None)
+    }
+
+    /// [`Heddle::declare_lease_mode`] as one attempt of a race (see
+    /// [`race`]): siblings sharing `race` are exempt from toe-steps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn declare_lease_raced(
+        &self,
+        repo_id: &str,
+        holder: &str,
+        goal: &str,
+        scope: Vec<String>,
+        criteria: Vec<String>,
+        ttl_ms: Option<u64>,
+        mode: IsolationMode,
+        race: Option<String>,
+    ) -> Result<DeclareOutcome, String> {
         let goal = cap(goal, MAX_GOAL_CHARS);
         if goal.is_empty() {
             return Err("a lease needs a one-sentence goal".into());
@@ -1204,6 +1226,7 @@ impl Heddle {
                 holder,
                 ttl_ms: ttl,
                 last_heartbeat_ms: now,
+                race,
             };
             let thread = Thread {
                 id: thread_id.clone(),
@@ -4007,6 +4030,7 @@ mod tests {
             holder: "dead machine".into(),
             ttl_ms: MIN_TTL_MS,
             last_heartbeat_ms: 1,
+            race: None,
         };
         let head_id = imported.head_stitch.clone().unwrap();
         heddle.with(|s, _| {
@@ -4250,5 +4274,49 @@ mod tests {
         let files = heat::compute(&heddle, &repo.id, false, "retries").unwrap();
         assert_eq!(files.regions.len(), 1);
         assert_eq!(files.regions[0].threads, 2);
+    }
+
+    #[test]
+    fn a_race_picks_the_smallest_green_and_only_red_losers_become_dead_ends() {
+        let (heddle, repo_dir, repo) = git_rig("race");
+        std::fs::write(repo_dir.join("src/util.rs"), "pub fn u() -> u32 {\n    1\n}\n").unwrap();
+        git_ok(&repo_dir, &["commit", "-qam", "u"]);
+        heddle
+            .register_repo(repo_dir.to_str().unwrap(), Some("! grep -q BROKEN src/util.rs".into()), false)
+            .unwrap();
+        let (race_id, attempts) =
+            race::start(&heddle, &repo.id, "t", "make u return 2", vec!["src/util.rs".into()], 3).unwrap();
+        assert!(attempts.iter().all(|d| d.toe_steps.is_empty()), "siblings never toe-step");
+        let write = |d: &DeclareOutcome, body: &str| {
+            std::fs::write(PathBuf::from(&d.working_dir).join("src/util.rs"), body).unwrap();
+            heddle.stitch(&d.lease.id).unwrap();
+        };
+        write(&attempts[0], "pub fn u() -> u32 {\n    BROKEN\n}\n");
+        write(&attempts[1], "pub fn u() -> u32 {\n    let a = 1;\n    let b = 1;\n    let c = a + b;\n    c\n}\n");
+        write(&attempts[2], "pub fn u() -> u32 {\n    2\n}\n");
+
+        let v = race::judge(&heddle, &repo.id, &race_id, "judge").unwrap();
+        assert_eq!(v.winner.as_deref(), Some(attempts[2].thread.id.as_str()));
+        let by_thread = |d: &DeclareOutcome| v.entries.iter().find(|e| e.thread == d.thread.id).unwrap();
+        assert_eq!(by_thread(&attempts[0]).green, Some(false));
+        assert!(by_thread(&attempts[0]).dead_end.is_some(), "red loser is a dead end");
+        assert_eq!(by_thread(&attempts[1]).green, Some(true));
+        assert!(by_thread(&attempts[1]).dead_end.is_none(), "a green loser is not a failure");
+        assert!(by_thread(&attempts[1]).outcome.contains("smaller change"));
+
+        let snap = heddle.snapshot();
+        let status = |d: &DeclareOutcome| snap.repo_states[&repo.id].threads.iter().find(|t| t.id == d.thread.id).unwrap().status;
+        assert_eq!(status(&attempts[0]), ThreadStatus::Abandoned);
+        assert_eq!(status(&attempts[1]), ThreadStatus::Abandoned);
+        assert_eq!(status(&attempts[2]), ThreadStatus::Active, "the winner waits for consent");
+        // The dead end carries the red verify and sits on the code.
+        let g = gloss::Repo::open(&repo_dir).unwrap();
+        let de = gloss::deadend::in_scope(&g, &["src/util.rs".into()]);
+        assert_eq!(de.len(), 1);
+        assert!(de[0].0.text.contains("verify was red"), "{}", de[0].0.text);
+        // Landing the winner is the ordinary path.
+        let p = heddle.propose(&attempts[2].thread.id).unwrap();
+        heddle.land_weave(&p.weave.id).unwrap();
+        assert!(std::fs::read_to_string(repo_dir.join("src/util.rs")).unwrap().contains("    2\n"));
     }
 }
