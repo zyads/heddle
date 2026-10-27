@@ -21,7 +21,7 @@ heddle gloss — notes for the next agent, anchored to the code they describe
        [--by NAME]                            gotcha todo deadend). Refuses
                                               secrets. Records commit + author
   gloss outline <file>                         symbol paths you can target
-  gloss check [prefix] [--fix] [--json]        every note: fresh / moved / STALE /
+  gloss check [prefix] [--fix] [--kind K]      every note: fresh / moved / STALE /
                                               ORPHANED. --fix re-anchors moved
                                               notes (never blesses stale ones)
   gloss verify <id> [--text \"<new text>\"]     the note still holds: rebaseline it
@@ -96,6 +96,10 @@ pub fn run(rest: &[String]) -> Result<(), String> {
             let opts = RenderOpts { numbers: !has(rest, "--plain"), show_untrusted: !has(rest, "--trusted") };
             let (text, notes) = gloss::read(&repo, file, &opts)?;
             print!("{text}");
+            let dead = notes.iter().filter(|(n, _)| n.kind == "deadend").count();
+            if dead > 0 {
+                eprintln!("gloss: {dead} DEAD END(s) in this file — approaches already tried and failed; read them first");
+            }
             let bad = notes.iter().filter(|(_, r)| !r.status.trustworthy()).count();
             if bad > 0 {
                 eprintln!("gloss: {bad} note(s) here are STALE/ORPHANED — `heddle gloss check` lists them");
@@ -126,9 +130,12 @@ pub fn run(rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         "check" | "ls" => {
-            let p = positional(rest, &[]);
             let fix = has(rest, "--fix");
-            let checked = gloss::check(&repo, p.first().map(String::as_str), fix)?;
+            let p = positional(rest, &["--kind"]);
+            let mut checked = gloss::check(&repo, p.first().map(String::as_str), fix)?;
+            if let Some(k) = flag(rest, "--kind") {
+                checked.retain(|c| c.note.kind == k);
+            }
             if has(rest, "--json") {
                 let views: Vec<_> = checked
                     .iter()

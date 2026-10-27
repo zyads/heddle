@@ -39,7 +39,8 @@ pub fn header(n: &Note, r: &Resolution) -> String {
         Status::Stale => "STALE: code changed since — verify before trusting".to_string(),
         Status::Orphaned => "ORPHANED: the code it described is gone".to_string(),
     };
-    format!("[gloss {} · {} · {} · {when} @{short} · {state}]", n.id, n.kind, n.author.by)
+    let kind = if n.kind == "deadend" { "DEAD END — tried before, failed" } else { n.kind.as_str() };
+    format!("[gloss {} · {kind} · {} · {when} @{short} · {state}]", n.id, n.author.by)
 }
 
 pub struct RenderOpts {

@@ -274,6 +274,10 @@ pub enum ThreadStatus {
     Woven,
     Orphaned,
     Adopted,
+    /// The holder gave up on this approach. Terminal, like `Woven`; what
+    /// was tried and why it failed is kept as dead-end notes (see
+    /// [`gloss::deadend`]) so the next agent does not try it again.
+    Abandoned,
 }
 
 impl ThreadStatus {
@@ -596,6 +600,21 @@ pub struct StitchOutcome {
 }
 
 /// What `propose` hands back after the gate ran.
+/// What [`Heddle::abandon`] hands back: enough to record the dead end.
+#[derive(Clone, Debug)]
+pub struct AbandonOutcome {
+    pub thread: Thread,
+    pub repo: RepoConfig,
+    /// Scoped manifest when the thread branched (empty for in-place threads).
+    pub base: BTreeMap<String, String>,
+    /// Scoped manifest at the thread's last stitch.
+    pub head: BTreeMap<String, String>,
+    /// The most recent red verify for this thread, if any.
+    pub last_red: Option<VerifyOutcome>,
+    /// The lease the thread held (now released).
+    pub lease_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProposeOutcome {
     pub weave: Weave,
@@ -1709,6 +1728,7 @@ impl Heddle {
                 }
                 ThreadStatus::Orphaned => return Err("thread is orphaned; adopt it first".into()),
                 ThreadStatus::Woven => return Err("thread already wove onto the fabric".into()),
+                ThreadStatus::Abandoned => return Err("thread was abandoned — lease a fresh thread to retry".into()),
             }
             let head = thread
                 .head_stitch
@@ -2073,6 +2093,63 @@ impl Heddle {
         })
     }
 
+    /// Give up on a thread: the approach did not work. The lease is
+    /// released, the thread becomes `Abandoned` (terminal — never offered as
+    /// an orphan to adopt), and the outcome carries what was tried — base and
+    /// head manifests plus the last red verify — so the caller can pin it to
+    /// the code as a dead end. Git throws failed attempts away; this is the
+    /// one place they are kept.
+    pub fn abandon(&self, thread_id: &str, why: &str) -> Result<AbandonOutcome, String> {
+        let now = now_ms();
+        self.with(|s, base| {
+            let repo_id = find_repo_of_thread(s, thread_id)
+                .ok_or_else(|| format!("no thread with id {thread_id}"))?;
+            reconcile_repo(s, &repo_id, now, base);
+            let repo = s
+                .repos
+                .iter()
+                .find(|r| r.id == repo_id)
+                .cloned()
+                .ok_or("thread's repo is not registered")?;
+            let rs = s.repo_states.get_mut(&repo_id).expect("repo state exists");
+            let thread = rs
+                .threads
+                .iter_mut()
+                .find(|t| t.id == thread_id)
+                .ok_or_else(|| format!("no thread with id {thread_id}"))?;
+            if matches!(thread.status, ThreadStatus::Woven | ThreadStatus::Abandoned) {
+                return Err(format!("thread {thread_id} is {:?} — nothing to abandon", thread.status));
+            }
+            thread.status = ThreadStatus::Abandoned;
+            thread.note = cap(&format!("abandoned: {why}"), MAX_GOAL_CHARS);
+            thread.approval_id = None;
+            let lease_id = thread.lease_id.take();
+            let thread = thread.clone();
+            if let Some(l) = &lease_id {
+                rs.leases.retain(|x| &x.id != l);
+            }
+            let manifest = |id: &Option<String>| {
+                id.as_ref()
+                    .and_then(|i| rs.stitches.iter().find(|st| &st.id == i))
+                    .map(|st| st.files.clone())
+                    .unwrap_or_default()
+            };
+            let (base_m, head_m) = (manifest(&thread.base_stitch), manifest(&thread.head_stitch));
+            let last_red = rs
+                .weaves
+                .iter()
+                .rev()
+                .find(|w| w.thread_id == thread_id && w.verify.result == VerifyResult::Red)
+                .map(|w| w.verify.clone());
+            store::append_event(
+                base,
+                &repo_id,
+                &serde_json::json!({"ts_ms": now, "kind": "abandoned", "thread": thread_id, "why": cap(why, 300)}),
+            );
+            Ok(AbandonOutcome { thread, repo, base: base_m, head: head_m, last_red, lease_id })
+        })
+    }
+
     // -- rebase & worktree hygiene ------------------------------------------
 
     /// Refresh an isolated thread's worktree from the fabric tip (the live
@@ -2330,7 +2407,7 @@ impl Heddle {
                     .push((t.id.clone(), format!("{wt} (already gone)")));
                 continue;
             }
-            if t.status != ThreadStatus::Woven {
+            if !matches!(t.status, ThreadStatus::Woven | ThreadStatus::Abandoned) {
                 report.skipped.push((
                     t.id.clone(),
                     format!("thread is {:?} — worktree still in use", t.status),
@@ -2928,7 +3005,7 @@ fn prune(s: &mut HeddleState) {
             let Some(pos) = rs
                 .threads
                 .iter()
-                .position(|t| t.status == ThreadStatus::Woven)
+                .position(|t| matches!(t.status, ThreadStatus::Woven | ThreadStatus::Abandoned))
             else {
                 break;
             };
@@ -3932,5 +4009,60 @@ mod tests {
         // The readable events survive around the corrupt line.
         let events = store::read_events(&heddle.base(), &repo.id, 50);
         assert!(events.iter().any(|e| e["kind"] == "lease_declared"));
+    }
+
+    #[test]
+    fn abandoning_pins_a_dead_end_where_the_attempt_happened() {
+        let (heddle, repo_dir, repo) = git_rig("deadend");
+        std::fs::write(
+            repo_dir.join("src/util.rs"),
+            "pub fn u() {}\n\npub fn hot(x: u32) -> u32 {\n    x + 1\n}\n",
+        )
+        .unwrap();
+        git_ok(&repo_dir, &["commit", "-qam", "hot path"]);
+        heddle
+            .register_repo(
+                repo_dir.to_str().unwrap(),
+                Some("echo 'thread main panicked at src/util.rs:4: assertion failed: lock held'; exit 1".into()),
+                false,
+            )
+            .unwrap();
+        let d = heddle
+            .declare_lease_mode(
+                &repo.id, "agent-a", "make hot() lock-free", vec!["src/**".into()], vec![], None,
+                IsolationMode::Auto,
+            )
+            .unwrap();
+        let wt = PathBuf::from(d.working_dir.clone());
+        std::fs::write(wt.join("src/util.rs"), "pub fn u() {}\n\npub fn hot(x: u32) -> u32 {\n    x.wrapping_add(1)\n}\n").unwrap();
+        std::fs::write(wt.join("src/atomics.rs"), "pub fn cas() {}\n").unwrap();
+        heddle.stitch(&d.lease.id).unwrap();
+        assert!(!heddle.propose(&d.thread.id).unwrap().green);
+
+        let out = heddle.abandon(&d.thread.id, "wrapping_add hides the overflow the lock was guarding").unwrap();
+        assert_eq!(out.thread.status, ThreadStatus::Abandoned);
+        assert!(out.last_red.is_some());
+        let snap = heddle.snapshot();
+        assert!(snap.repo_states[&repo.id].leases.is_empty(), "lease released");
+        assert!(heddle.propose(&d.thread.id).unwrap_err().contains("abandoned"));
+        assert!(heddle.abandon(&d.thread.id, "again").is_err());
+
+        let rec = gloss::deadend::record(&heddle, &out, "wrapping_add hides the overflow the lock was guarding", "agent-a").unwrap();
+        let anchors: Vec<&str> = rec.notes.iter().map(|n| n.anchor.as_str()).collect();
+        assert!(anchors.iter().any(|a| a.ends_with("src/util.rs::hot")), "{anchors:?}");
+        assert!(!anchors.iter().any(|a| a.ends_with("::u")), "untouched symbols stay clean: {anchors:?}");
+        assert!(rec.unanchored.iter().any(|u| u.contains("src/atomics.rs (new file)")), "{:?}", rec.unanchored);
+        assert!(rec.text.contains("Tried: make hot() lock-free"), "{}", rec.text);
+        assert!(rec.text.contains("panicked at src/util.rs:4"), "{}", rec.text);
+
+        // Seen by the next agent: under its lease scope, and in the inline read.
+        let g = gloss::Repo::open(&repo_dir).unwrap();
+        assert_eq!(gloss::deadend::in_scope(&g, &["src/**".into()]).len(), 1);
+        assert!(gloss::deadend::in_scope(&g, &["docs/**".into()]).is_empty());
+        let (text, _) = gloss::read(&g, "src/util.rs", &gloss::render::RenderOpts { numbers: false, show_untrusted: true }).unwrap();
+        let i = text.find("DEAD END").expect("rendered");
+        assert!(i < text.find("pub fn hot").unwrap(), "{text}");
+        // The main checkout was never touched.
+        assert!(std::fs::read_to_string(repo_dir.join("src/util.rs")).unwrap().contains("x + 1"));
     }
 }

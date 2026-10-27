@@ -51,6 +51,12 @@ usage:
   heddle rebase [--thread ID]                   refresh the thread's worktree from
                                               the fabric (after \"fabric moved\")
   heddle withdraw                               return a proposed thread to active
+  heddle abandon [--thread ID] \"<why>\"          give up on this approach: the lease
+                                              is released and what was tried is
+                                              pinned to the code it touched as a
+                                              DEAD END note (goal, why, last red
+                                              verify), shown first to the next
+                                              agent who leases or reads there
   heddle adopt <thread-id>                      take over an orphaned thread
                                               (local, or a synced peer's)
   heddle adopt [--dry-run]                      (no thread id) wire THIS repo so
@@ -71,7 +77,7 @@ usage:
   heddle savings --record-tokens ID N           attach a real token count to
                                               thread ID; recorded ground truth
                                               replaces the estimate's assumption
-  heddle clean                                  remove worktrees of woven threads
+  heddle clean                                  remove worktrees of finished threads
                                               (refuses uncaptured divergence)
   heddle sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
        [--anyway]                             git remote. Publishes the content
@@ -117,6 +123,7 @@ fn main() -> ExitCode {
         "export" => cmd_export(rest),
         "rebase" => cmd_rebase(rest),
         "withdraw" => cmd_withdraw(),
+        "abandon" => cmd_abandon(rest),
         "adopt" => cmd_adopt(rest),
         "clean" => cmd_clean(),
         "repair" => cmd_repair(rest),
@@ -565,6 +572,7 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
         "  expires in {}s without a heartbeat (stitching heartbeats for you)",
         out.lease.ttl_ms / 1000
     );
+    print_dead_ends(&repo, &out.lease.scope);
     for t in &out.toe_steps {
         println!("  TOE-STEP: your '{}' overlaps '{}' ({} vs {})", t.goal_a, t.goal_b, t.pattern_a, t.pattern_b);
         for s in &t.suggested_split {
@@ -574,6 +582,28 @@ fn cmd_lease(rest: &[String]) -> Result<(), String> {
     }
     autosync(engine, &repo);
     Ok(())
+}
+
+/// Dead ends recorded under a fresh lease's scope — printed before anything
+/// else the agent reads about its task, because they are the cheapest
+/// lesson it will get.
+fn print_dead_ends(repo: &RepoConfig, scope: &[String]) {
+    let Ok(g) = heddle::gloss::Repo::open(&repo.path) else { return };
+    let found = heddle::gloss::deadend::in_scope(&g, scope);
+    if found.is_empty() {
+        return;
+    }
+    println!("  DEAD ENDS in this scope — tried before, failed:");
+    for (n, r) in found.iter().take(5) {
+        let state = r.as_ref().map_or("?", |r| r.status.word());
+        println!("    {} {} ({state})", n.id, n.anchor.label());
+        for l in n.text.lines() {
+            println!("      {l}");
+        }
+    }
+    if found.len() > 5 {
+        println!("    … {} more: `heddle gloss check --kind deadend`", found.len() - 5);
+    }
 }
 
 /// Fire an auto-sync pass when the repo opted in; print, never fail the
@@ -821,6 +851,50 @@ fn cmd_propose(rest: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_abandon(rest: &[String]) -> Result<(), String> {
+    let mut why = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--thread" || a == "--lease" {
+            it.next();
+        } else {
+            why.push(a.as_str());
+        }
+    }
+    let why = why.join(" ");
+    if why.trim().is_empty() {
+        return Err("say why: `heddle abandon \"<what failed and why>\"` — that sentence is the \
+                    whole value of a dead end"
+            .into());
+    }
+    let engine = store();
+    let (repo, _lease, thread_id) = target(engine, rest)?;
+    let out = engine.abandon(&thread_id, &why)?;
+    if solo::get(&engine.base(), &repo.id).is_some_and(|p| p.thread_id == thread_id) {
+        solo::clear(&engine.base(), &repo.id);
+    }
+    println!("thread {thread_id} abandoned; lease released");
+    match heddle::gloss::deadend::record(engine, &out, &why, &gloss_cli::author(None).by) {
+        Ok(r) => {
+            println!("dead end {} pinned to {} site(s):", r.group, r.notes.len());
+            for n in &r.notes {
+                println!("  {} {}", n.id, n.anchor);
+            }
+            for u in &r.unanchored {
+                println!("  not pinned: {u}");
+            }
+            for l in r.text.lines() {
+                println!("  | {l}");
+            }
+        }
+        Err(e) => println!("dead end NOT recorded: {e}"),
+    }
+    if out.thread.worktree.is_some() {
+        println!("worktree kept for inspection; `heddle clean` removes it");
+    }
+    Ok(())
 }
 
 fn cmd_withdraw() -> Result<(), String> {
