@@ -233,9 +233,14 @@ by the effort agents spent on them. It only uses what heddle observed:
 
 ```
 region                                     thr retries   red  refused rebases elapsed    tokens notes
-src/util.rs::hot                             1       3     2        0       0     41s         -     0  ← hot, no notes
-src/util.rs::u                               1       0     0        0       0     12s     12000     0
+src/util.rs::hot                             1       3     2        0       0      2s         -     1
+src/util.rs::u                               1       0     0        0       0      1s     12000     0
 ```
+
+That's a real run: one thread hit two red verifies on `hot` and was
+abandoned, and another documented `u` with 12k recorded tokens. The `1`
+note on `hot` is the dead end its abandonment left behind, which is why the
+row isn't flagged `← hot, no notes`.
 
 - **retries** = red verifies + lands refused because the fabric moved +
   abandoned threads. All of these are counted events.
