@@ -73,6 +73,7 @@ pub mod context;
 pub mod enroll;
 pub mod gloss;
 pub mod lease;
+pub mod merge;
 pub mod savings;
 pub mod solo;
 pub mod store;
@@ -576,6 +577,9 @@ pub struct DeclareOutcome {
 pub struct RebaseOutcome {
     pub thread: Thread,
     pub fast_forwarded: Vec<String>,
+    /// Changed on both sides in non-touching lines: merged line by line
+    /// into the worktree (the next propose verifies the merged file).
+    pub merged: Vec<String>,
     pub conflicts: Vec<String>,
     pub approval_id: Option<String>,
 }
@@ -597,6 +601,11 @@ pub struct StitchOutcome {
     pub stitch: Stitch,
     pub unchanged: bool,
     pub skipped: Vec<String>,
+    /// Symbol leases only: edited line ranges that fall outside every
+    /// leased symbol (`src/a.rs:L40-44`). Kept — a stitch never drops a
+    /// line of a captured file — but said out loud, because those lines
+    /// are where another agent's lease on the same file can collide.
+    pub outside_symbols: Vec<String>,
     pub lease: Lease,
 }
 
@@ -1463,6 +1472,10 @@ impl Heddle {
                     .or_insert_with(|| TOMBSTONE.to_string());
             }
         }
+        let outside_symbols = base_manifest
+            .as_ref()
+            .map(|b| outside_leased_symbols(&lease.scope, b, &manifest, &objects))
+            .unwrap_or_default();
         // Phase 3 (locked): record the stitch (or report "unchanged").
         self.with(|s, base| {
             let rs = s.repo_states.get_mut(&repo.id).expect("repo state exists");
@@ -1474,6 +1487,7 @@ impl Heddle {
                         stitch: p.clone(),
                         unchanged: true,
                         skipped: captured.skipped,
+                        outside_symbols,
                         lease: lease.clone(),
                     });
                 }
@@ -1491,6 +1505,7 @@ impl Heddle {
                             stitch: bs,
                             unchanged: true,
                             skipped: captured.skipped,
+                            outside_symbols,
                             lease: lease.clone(),
                         });
                     }
@@ -1533,6 +1548,7 @@ impl Heddle {
                 stitch,
                 unchanged: false,
                 skipped: captured.skipped,
+                outside_symbols,
                 lease: lease.clone(),
             })
         })
@@ -2251,6 +2267,7 @@ impl Heddle {
                 .or_insert_with(|| TOMBSTONE.to_string());
         }
         let mut fast_forwarded = Vec::new();
+        let mut merged = Vec::new();
         let mut conflicts = Vec::new();
         for rel in &rels {
             let wt_h = eff(&wt_cap.manifest, rel);
@@ -2283,7 +2300,26 @@ impl Heddle {
                 }
                 fast_forwarded.push(rel.clone());
             } else if thread_changed && fabric_changed && wt_h != repo_h {
-                conflicts.push(rel.clone());
+                // Both sides edited the file. Try a line-level three-way
+                // merge — two symbol leases in one file land here — and
+                // fall back to an honest conflict when the edits touch.
+                let text = |h: &Option<String>| -> Option<String> {
+                    let h = h.as_ref().filter(|h| h.as_str() != TOMBSTONE)?;
+                    String::from_utf8(store::read_blob(&objects, h).ok()?).ok()
+                };
+                match (text(&base_h), text(&wt_h), text(&repo_h)) {
+                    (Some(b), Some(o), Some(t)) => match merge::merge3(&b, &o, &t) {
+                        merge::Merged::Clean(m) => {
+                            let h = store::put_blob(&objects, m.as_bytes())?;
+                            let dest = weave::safe_join(&wt_path, rel)?;
+                            std::fs::write(&dest, m).map_err(|e| format!("rebase write {rel}: {e}"))?;
+                            final_head.insert(rel.clone(), h);
+                            merged.push(rel.clone());
+                        }
+                        merge::Merged::Conflict(_) => conflicts.push(rel.clone()),
+                    },
+                    _ => conflicts.push(rel.clone()), // binary, or a delete on either side
+                }
             }
         }
         // Drop tombstones for files the new base does not have either — a
@@ -2348,12 +2384,13 @@ impl Heddle {
                 &repo.id,
                 &serde_json::json!({
                     "ts_ms": now_ms(), "kind": "rebased", "thread": thread_id,
-                    "fast_forwarded": fast_forwarded.len(), "conflicts": conflicts,
+                    "fast_forwarded": fast_forwarded.len(), "merged": merged, "conflicts": conflicts,
                 }),
             );
             Ok(RebaseOutcome {
                 thread,
                 fast_forwarded: fast_forwarded.clone(),
+                merged: merged.clone(),
                 conflicts: conflicts.clone(),
                 approval_id,
             })
@@ -2873,6 +2910,48 @@ fn reconcile_repo(s: &mut HeddleState, repo_id: &str, now: u64, base: &PathBuf) 
 /// The head-vs-base delta of one thread: the repo-relative paths it actually
 /// changed. A tombstone counts only when the base HAD the file (deleting
 /// what never existed is not an edit).
+/// For each file a symbol lease names, the edited line ranges (vs base)
+/// that no leased symbol covers. Read-only; at most 12 entries.
+fn outside_leased_symbols(
+    scope: &[String],
+    base: &BTreeMap<String, String>,
+    head: &BTreeMap<String, String>,
+    objects: &Path,
+) -> Vec<String> {
+    let mut by_file: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for p in scope {
+        if let (file, Some(sym)) = lease::split_symbol(p) {
+            by_file.entry(file).or_default().push(sym);
+        }
+    }
+    // A glob over the same file leases all of it — nothing is "outside".
+    by_file.retain(|f, _| !scope.iter().any(|p| lease::split_symbol(p).1.is_none() && lease::glob_match(p, f)));
+    let text = |h: Option<&String>| {
+        h.filter(|h| h.as_str() != TOMBSTONE)
+            .and_then(|h| store::read_blob(objects, h).ok())
+            .and_then(|b| String::from_utf8(b).ok())
+    };
+    let mut out = Vec::new();
+    for (file, syms) in by_file {
+        let (Some(old), Some(new)) = (text(base.get(file)), text(head.get(file))) else { continue };
+        if old == new {
+            continue;
+        }
+        let spans: Vec<(usize, usize)> = gloss::anchor::outline(file, &new)
+            .into_iter()
+            .filter(|s| syms.iter().any(|l| lease::symbols_overlap(l, &s.path) && (s.path == *l || s.path.starts_with(&format!("{l}::")))))
+            .map(|s| (s.start, s.end))
+            .collect();
+        for (a, b) in merge::changed_ranges(&old, &new) {
+            if !spans.iter().any(|(s, e)| *s <= a && b <= *e) {
+                out.push(format!("{file}:L{a}-{b} (outside {})", syms.join(", ")));
+            }
+        }
+    }
+    out.truncate(12);
+    out
+}
+
 fn changed_vs_base(
     head: &BTreeMap<String, String>,
     base: &BTreeMap<String, String>,
@@ -4065,5 +4144,62 @@ mod tests {
         assert!(i < text.find("pub fn hot").unwrap(), "{text}");
         // The main checkout was never touched.
         assert!(std::fs::read_to_string(repo_dir.join("src/util.rs")).unwrap().contains("x + 1"));
+    }
+
+    #[test]
+    fn two_agents_one_file_different_symbols_both_land() {
+        let (heddle, repo_dir, repo) = git_rig("symlease");
+        let auth = "pub fn refresh(t: u32) -> u32 {\n    t + 1\n}\n\npub fn helper() {}\n\npub fn login(u: &str) -> bool {\n    !u.is_empty()\n}\n";
+        std::fs::write(repo_dir.join("src/auth.rs"), auth).unwrap();
+        git_ok(&repo_dir, &["add", "-A"]);
+        git_ok(&repo_dir, &["commit", "-qm", "auth"]);
+        let lease = |who: &str, sym: &str| {
+            heddle
+                .declare_lease_mode(&repo.id, who, &format!("work on {sym}"), vec![format!("src/auth.rs::{sym}")], vec![], None, IsolationMode::Auto)
+                .unwrap()
+        };
+        let a = lease("a", "refresh");
+        let b = lease("b", "login");
+        assert!(b.toe_steps.is_empty(), "different symbols in one file do not collide: {:?}", b.toe_steps);
+        let c = heddle
+            .declare_lease_mode(&repo.id, "c", "also refresh", vec!["src/auth.rs::refresh".into()], vec![], None, IsolationMode::Auto)
+            .unwrap();
+        assert_eq!(c.toe_steps.len(), 1, "the same symbol does");
+        heddle.release_lease(&c.lease.id).unwrap();
+
+        let edit = |d: &DeclareOutcome, from: &str, to: &str| {
+            let f = PathBuf::from(&d.working_dir).join("src/auth.rs");
+            let body = std::fs::read_to_string(&f).unwrap();
+            assert!(body.contains(from));
+            std::fs::write(&f, body.replace(from, to)).unwrap();
+        };
+        edit(&a, "    t + 1\n", "    t.saturating_add(1)\n");
+        edit(&b, "    !u.is_empty()\n", "    !u.trim().is_empty()\n");
+        let sa = heddle.stitch(&a.lease.id).unwrap();
+        assert!(sa.outside_symbols.is_empty(), "{:?}", sa.outside_symbols);
+        // B also strays outside its symbol: kept, but flagged.
+        edit(&b, "pub fn helper() {}\n", "pub fn helper() { /* b */ }\n");
+        let sb = heddle.stitch(&b.lease.id).unwrap();
+        assert_eq!(sb.outside_symbols.len(), 1, "{:?}", sb.outside_symbols);
+        assert!(sb.outside_symbols[0].starts_with("src/auth.rs:L5-5"), "{:?}", sb.outside_symbols);
+        edit(&b, "pub fn helper() { /* b */ }\n", "pub fn helper() {}\n");
+        assert!(heddle.stitch(&b.lease.id).unwrap().outside_symbols.is_empty());
+
+        // A lands first.
+        let pa = heddle.propose(&a.thread.id).unwrap();
+        assert!(pa.green);
+        heddle.land_weave(&pa.weave.id).unwrap();
+        // B's land is refused (the file moved under it) — then rebase merges
+        // the two functions' edits line by line instead of handing B a conflict.
+        let pb = heddle.propose(&b.thread.id).unwrap();
+        assert!(heddle.land_weave(&pb.weave.id).is_err());
+        let rb = heddle.rebase_thread(&b.thread.id).unwrap();
+        assert!(rb.conflicts.is_empty(), "{:?}", rb.conflicts);
+        assert_eq!(rb.merged, vec!["src/auth.rs".to_string()]);
+        let pb = heddle.propose(&b.thread.id).unwrap();
+        assert!(pb.green);
+        heddle.land_weave(&pb.weave.id).unwrap();
+        let landed = std::fs::read_to_string(repo_dir.join("src/auth.rs")).unwrap();
+        assert!(landed.contains("t.saturating_add(1)") && landed.contains("!u.trim().is_empty()"), "{landed}");
     }
 }

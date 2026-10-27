@@ -110,7 +110,9 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {
                 "goal": {"type": "string", "description": "One sentence: what you are about to do."},
                 "scope": {"type": "array", "items": {"type": "string"},
-                          "description": "Repo-relative path globs you intend to touch."},
+                          "description": "Repo-relative path globs you intend to touch, or symbols \
+                          (`src/auth.rs::Session::refresh`): a symbol lease only collides with leases \
+                          on the same symbol, so agents can share a file."},
                 "criteria": {"type": "array", "items": {"type": "string"},
                              "description": "Acceptance criteria (optional)."},
                 "ttl_ms": {"type": "integer", "description":
@@ -395,6 +397,7 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
             Ok(json!({
                 "thread": out.thread,
                 "fast_forwarded": out.fast_forwarded,
+                "merged": out.merged,
                 "conflicts": out.conflicts,
                 "note": if out.conflicts.is_empty() {
                     "rebased clean — heddle_stitch, then heddle_propose when ready".to_string()
@@ -428,6 +431,11 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                 "unchanged": out.unchanged,
                 "files": out.stitch.files.len(),
                 "skipped": out.skipped,
+                "outside_leased_symbols": if out.outside_symbols.is_empty() { Value::Null } else { json!({
+                    "edits": out.outside_symbols,
+                    "note": "these edits are kept, but they sit outside the symbols you leased — another agent's \
+                             lease on this file could collide there; widen your lease if you need them",
+                }) },
                 "lease_expires_in_ms": out.lease.expires_in_ms(heddle_now()),
                 "auto_sync": autosync_note(engine, &repo),
             })

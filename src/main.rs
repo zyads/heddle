@@ -41,7 +41,13 @@ usage:
                                               the git-bridge granularity
   heddle lease \"<goal>\" <scope...>              declare an intent lease; on a git
        [--criteria TEXT]... [--ttl-ms N]      repo the thread gets its OWN
-       [--isolated | --in-place]              worktree — edit there
+       [--isolated | --in-place]              worktree — edit there. A scope
+                                              entry may be a SYMBOL,
+                                              src/auth.rs::Session::refresh:
+                                              it collides only with leases on
+                                              that symbol, so agents can share
+                                              a file; rebase merges their
+                                              disjoint edits line by line
   heddle stitch [--lease ID]                    checkpoint the leased scope
   heddle propose [--thread ID]                  verify in a scratch copy; green
                                               asks you before applying
@@ -712,11 +718,14 @@ fn cmd_rebase(rest: &[String]) -> Result<(), String> {
     let engine = store();
     let (_repo, _lease_id, thread_id) = target(engine, rest)?;
     let out = engine.rebase_thread(&thread_id)?;
-    if out.fast_forwarded.is_empty() && out.conflicts.is_empty() {
+    if out.fast_forwarded.is_empty() && out.conflicts.is_empty() && out.merged.is_empty() {
         println!("already in step with the fabric — nothing to do");
     }
     for f in &out.fast_forwarded {
         println!("  fast-forwarded from fabric: {f}");
+    }
+    for f in &out.merged {
+        println!("  merged line by line (both sides edited different parts): {f}");
     }
     if !out.conflicts.is_empty() {
         println!("  CONFLICTS — both the fabric and this thread changed:");
@@ -803,6 +812,9 @@ fn cmd_stitch(rest: &[String]) -> Result<(), String> {
         } else {
             println!("stitch {} ({} files)", out.stitch.id, out.stitch.files.len());
         }
+    }
+    for o in &out.outside_symbols {
+        println!("  edit outside your leased symbols: {o} — kept, but lease it if another agent may touch it");
     }
     for s in &out.skipped {
         println!("  skipped: {s}");

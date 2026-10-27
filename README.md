@@ -50,7 +50,8 @@ already working on this?" and route around each other.
 - **Isolation** — every task gets its own git worktree; two threads
   *physically cannot* clobber each other's edits.
 - **Coordination** — before editing, a thread declares an **intent lease**
-  (machine-readable goal + file globs); overlaps warn at declaration time,
+  (machine-readable goal + file globs, or individual symbols like
+  `src/auth.rs::Session::refresh`); overlaps warn at declaration time,
   which lets agents self-partition work over MCP with no human traffic cop.
   Leases warn, they never block — an agent is never stopped; the only gate is
   at landing.
@@ -197,6 +198,32 @@ Memory tools (work in any git repo, no `heddle init` needed):
 `heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end) and `heddle_context`
 (a task's minimal context: start there). `heddle_propose` also takes `learned: [{target, text,
 kind}]`: the moment an agent knows the most is the moment it proposes.
+
+## Symbol leases: two agents, one file
+
+File globs are too coarse once agents get good. Two of them fixing two
+different functions in `src/auth.rs` used to collide at lease time, and
+again at land time. A scope entry can now name a symbol:
+
+```bash
+heddle lease "harden token refresh" 'src/auth.rs::Session::refresh'
+heddle lease "trim usernames"       'src/auth.rs::Session::login'    # no toe-step: different symbols
+heddle lease "rework sessions"      'src/auth.rs::Session'           # toe-step: it contains both
+```
+
+- **Overlap is per symbol.** The same symbol, or one nested in the other,
+  collides; siblings don't. A glob that covers the file reaches every
+  symbol in it, so glob leases keep working unchanged.
+- **Stitches still capture the whole file** and never drop a line. Edits
+  outside your leased symbols are kept and flagged (`edit outside your
+  leased symbols: src/auth.rs:L40-44`), because those lines are where
+  another agent can collide.
+- **Landing stays green-by-construction.** The second agent's land is
+  still refused ("fabric moved under you"); nothing unverified ever lands.
+  But `heddle rebase` now does a line-level three-way merge (Myers diff,
+  in-crate). Edits that don't touch merge into the worktree, and the next
+  `propose` verifies the merged file. Edits that overlap or touch stay an
+  honest conflict.
 
 ## Gloss — memory pinned to code
 
