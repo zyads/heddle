@@ -83,6 +83,12 @@ usage:
   heddle savings --record-tokens ID N           attach a real token count to
                                               thread ID; recorded ground truth
                                               replaces the estimate's assumption
+  heddle heat [--by retries|time|tokens]        where agents burn effort, per symbol
+       [--files] [--limit N] [--json]         (or file): red verifies, refused
+                                              lands, abandons, rebases, elapsed
+                                              time, recorded tokens — counted,
+                                              never estimated; flags hot regions
+                                              with no gloss notes
   heddle clean                                  remove worktrees of finished threads
                                               (refuses uncaptured divergence)
   heddle sync [--remote NAME] [--auto on|off]   sync leases/threads/fabric with a
@@ -145,6 +151,7 @@ fn main() -> ExitCode {
         "log" => cmd_log(),
         "gloss" => gloss_cli::run(rest),
         "context" => cmd_context(rest),
+        "heat" => cmd_heat(rest),
         "mcp" => {
             mcp::serve(store());
             Ok(())
@@ -870,6 +877,23 @@ fn cmd_propose(rest: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_heat(rest: &[String]) -> Result<(), String> {
+    let engine = store();
+    let repo = current_repo(engine)?;
+    let by = flag_value(rest, "--by")?.unwrap_or_else(|| "retries".into());
+    if !["retries", "time", "tokens"].contains(&by.as_str()) {
+        return Err(format!("--by takes retries | time | tokens, not '{by}'"));
+    }
+    let limit = flag_value(rest, "--limit")?.and_then(|v| v.parse().ok()).unwrap_or(25);
+    let heat = heddle::heat::compute(engine, &repo.id, !rest.iter().any(|a| a == "--files"), &by)?;
+    if rest.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&heat).map_err(|e| e.to_string())?);
+    } else {
+        print!("{}", heddle::heat::render(&heat, limit));
+    }
+    Ok(())
 }
 
 fn cmd_context(rest: &[String]) -> Result<(), String> {

@@ -126,7 +126,7 @@ pub fn tokens_path(base: &Path, repo_id: &str) -> PathBuf {
     base.join(repo_id).join("tokens.json")
 }
 
-fn load_tokens(base: &Path, repo_id: &str) -> BTreeMap<String, u64> {
+pub(crate) fn load_tokens(base: &Path, repo_id: &str) -> BTreeMap<String, u64> {
     std::fs::read_to_string(tokens_path(base, repo_id))
         .ok()
         .and_then(|b| serde_json::from_str(&b).ok())

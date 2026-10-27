@@ -72,6 +72,7 @@ pub mod consent;
 pub mod context;
 pub mod enroll;
 pub mod gloss;
+pub mod heat;
 pub mod lease;
 pub mod merge;
 pub mod savings;
@@ -4201,5 +4202,53 @@ mod tests {
         heddle.land_weave(&pb.weave.id).unwrap();
         let landed = std::fs::read_to_string(repo_dir.join("src/auth.rs")).unwrap();
         assert!(landed.contains("t.saturating_add(1)") && landed.contains("!u.trim().is_empty()"), "{landed}");
+    }
+
+    #[test]
+    fn heat_counts_retries_per_symbol_and_never_splits_tokens() {
+        let (heddle, repo_dir, repo) = git_rig("heat");
+        std::fs::write(
+            repo_dir.join("src/util.rs"),
+            "pub fn u() {}\n\npub fn hot(x: u32) -> u32 {\n    x + 1\n}\n",
+        )
+        .unwrap();
+        git_ok(&repo_dir, &["commit", "-qam", "hot"]);
+        let lease = |goal: &str| {
+            heddle
+                .declare_lease_mode(&repo.id, "t", goal, vec!["src/util.rs".into()], vec![], None, IsolationMode::Auto)
+                .unwrap()
+        };
+        // Thread A fights hot(): two red verifies, then gives up.
+        heddle.register_repo(repo_dir.to_str().unwrap(), Some("false".into()), false).unwrap();
+        let a = lease("speed up hot");
+        let f = PathBuf::from(&a.working_dir).join("src/util.rs");
+        std::fs::write(&f, std::fs::read_to_string(&f).unwrap().replace("x + 1", "x << 1")).unwrap();
+        heddle.stitch(&a.lease.id).unwrap();
+        assert!(!heddle.propose(&a.thread.id).unwrap().green);
+        assert!(!heddle.propose(&a.thread.id).unwrap().green);
+        heddle.abandon(&a.thread.id, "shift is not +1").unwrap();
+        // Thread B edits u() and lands cleanly, with a recorded token count.
+        heddle.register_repo(repo_dir.to_str().unwrap(), Some("true".into()), false).unwrap();
+        let b = lease("doc u");
+        let f = PathBuf::from(&b.working_dir).join("src/util.rs");
+        std::fs::write(&f, std::fs::read_to_string(&f).unwrap().replace("pub fn u() {}", "pub fn u() { /* doc */ }")).unwrap();
+        heddle.stitch(&b.lease.id).unwrap();
+        let p = heddle.propose(&b.thread.id).unwrap();
+        heddle.land_weave(&p.weave.id).unwrap();
+        savings::record_tokens(&heddle, &repo.id, &b.thread.id, 12_000).unwrap();
+
+        let h = heat::compute(&heddle, &repo.id, true, "retries").unwrap();
+        let names: Vec<&str> = h.regions.iter().map(|r| r.region.as_str()).collect();
+        assert_eq!(names, vec!["src/util.rs::hot", "src/util.rs::u"], "hottest first");
+        let hot = &h.regions[0];
+        assert_eq!((hot.red_verifies, hot.abandoned, hot.retries()), (2, 1, 3));
+        assert_eq!((hot.tokens, hot.threads_with_tokens), (0, 0), "no recorded tokens → none claimed");
+        let u = &h.regions[1];
+        assert_eq!((u.retries(), u.tokens, u.threads_with_tokens), (0, 12_000, 1));
+        assert!(heat::render(&h, 10).contains("hot, no notes"));
+        // File granularity folds both into one row.
+        let files = heat::compute(&heddle, &repo.id, false, "retries").unwrap();
+        assert_eq!(files.regions.len(), 1);
+        assert_eq!(files.regions[0].threads, 2);
     }
 }
