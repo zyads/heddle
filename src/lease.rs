@@ -17,6 +17,12 @@
 //! * a fully-literal pattern matches that exact file OR any path under it
 //!   (so `src` leases the whole directory, which is what people mean)
 //!
+//! * `path::Symbol` (e.g. `src/auth.rs::Session::refresh`) — a **symbol
+//!   lease**: it captures the file like a literal path, but overlaps another
+//!   lease only on the same symbol (or one nested in it). Two agents in one
+//!   file stop colliding unless they touch the same function; rebase merges
+//!   their disjoint edits line by line (see [`crate::merge`]).
+//!
 //! Character classes (`[ab]`), brace sets and negation are NOT supported —
 //! a `[` is just a bracket. Overlap approximation: two patterns are said to
 //! overlap when walking their segments never hits two *literal* segments
@@ -39,6 +45,14 @@ pub fn validate_scope(scope: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for raw in scope {
         let p = raw.trim().trim_start_matches("./").to_string();
+        if let (file, Some(sym)) = split_symbol(&p) {
+            if !file.split('/').all(is_literal) {
+                return Err(format!("bad scope pattern {p:?}: a symbol lease names one file, no wildcards"));
+            }
+            if sym.is_empty() || !sym.split("::").all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || "_$#".contains(c))) {
+                return Err(format!("bad scope pattern {p:?}: the symbol must look like Type::method"));
+            }
+        }
         if p.is_empty() || p.chars().count() > MAX_PATTERN_CHARS {
             return Err(format!("bad scope pattern {raw:?}: empty or too long"));
         }
@@ -55,8 +69,25 @@ pub fn validate_scope(scope: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Does `pattern` match the repo-relative `path` (a FILE path)?
+/// `src/a.rs::Type::f` → (`src/a.rs`, Some(`Type::f`)); a glob → (glob, None).
+pub fn split_symbol(pattern: &str) -> (&str, Option<&str>) {
+    match pattern.split_once("::") {
+        Some((f, s)) => (f, Some(s)),
+        None => (pattern, None),
+    }
+}
+
+/// Do two symbol paths overlap — the same symbol, or one nested in the other?
+pub fn symbols_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}::")) || b.starts_with(&format!("{a}::"))
+}
+
+/// Does `pattern` match the repo-relative `path` (a FILE path)? A symbol
+/// pattern matches exactly its file — files are what stitches capture.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
+    if let (file, Some(_)) = split_symbol(pattern) {
+        return file == path;
+    }
     let p: Vec<&str> = pattern.split('/').collect();
     let s: Vec<&str> = path.split('/').collect();
     if match_segs(&p, &s) {
@@ -101,6 +132,14 @@ fn is_literal(seg: &str) -> bool {
 /// The approximate pattern-vs-pattern overlap test (limits in the module
 /// doc). Symmetric; conservative toward "yes".
 pub fn patterns_may_overlap(a: &str, b: &str) -> bool {
+    match (split_symbol(a), split_symbol(b)) {
+        ((fa, Some(sa)), (fb, Some(sb))) => return fa == fb && symbols_overlap(sa, sb),
+        // A symbol lease vs a glob: the glob reaches the symbol iff it
+        // reaches the file.
+        ((fa, Some(_)), _) => return glob_match(b, fa) || patterns_may_overlap(fa, b),
+        (_, (fb, Some(_))) => return glob_match(a, fb) || patterns_may_overlap(a, fb),
+        _ => {}
+    }
     let pa: Vec<&str> = a.split('/').collect();
     let pb: Vec<&str> = b.split('/').collect();
     let mut i = 0;
@@ -140,7 +179,8 @@ pub fn patterns_may_overlap(a: &str, b: &str) -> bool {
 /// The literal directory prefix of a pattern: segments before the first
 /// wildcard-containing one. `src/parse/**` → `src/parse`; `**` → ``.
 pub fn literal_prefix(pattern: &str) -> String {
-    pattern
+    split_symbol(pattern)
+        .0
         .split('/')
         .take_while(|seg| is_literal(seg))
         .collect::<Vec<_>>()
@@ -230,6 +270,27 @@ pub fn suggest_split(a: &str, b: &str) -> Vec<String> {
 mod tests {
     use super::super::{Thread, ThreadStatus};
     use super::*;
+
+    #[test]
+    fn symbol_leases_overlap_only_on_the_same_symbol() {
+        let refresh = "src/auth.rs::Session::refresh";
+        let login = "src/auth.rs::Session::login";
+        assert!(!patterns_may_overlap(refresh, login), "same file, different functions");
+        assert!(patterns_may_overlap(refresh, refresh));
+        assert!(patterns_may_overlap(refresh, "src/auth.rs::Session"), "nested in the type");
+        assert!(!patterns_may_overlap(refresh, "src/auth.rs::SessionStore"), "prefix of a NAME is not nesting");
+        assert!(patterns_may_overlap(refresh, "src/**"), "a glob over the file reaches every symbol");
+        assert!(patterns_may_overlap("src/auth.rs", refresh));
+        assert!(!patterns_may_overlap(refresh, "docs/**"));
+        assert!(!patterns_may_overlap(refresh, "src/other.rs::Session::refresh"));
+        assert!(glob_match(refresh, "src/auth.rs"));
+        assert!(!glob_match(refresh, "src/auth.rs.bak"));
+        assert_eq!(literal_prefix(refresh), "src/auth.rs");
+        assert!(validate_scope(&[refresh.into()]).is_ok());
+        assert!(validate_scope(&["src/*.rs::f".into()]).is_err(), "no wildcards with a symbol");
+        assert!(validate_scope(&["src/a.rs::".into()]).is_err());
+        assert!(validate_scope(&["src/a.rs::f g".into()]).is_err());
+    }
 
     #[test]
     fn glob_match_covers_the_supported_grammar() {
