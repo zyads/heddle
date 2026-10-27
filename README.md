@@ -59,6 +59,11 @@ already working on this?" and route around each other.
   a file changed in both the fabric and the thread refuses to land ("fabric
   moved under you — rebase") instead of overwriting either side. Never-red
   main means no fleet-wide token burn diagnosing a stranger's breakage.
+- **Memory** (`heddle gloss`) — what an agent learned is pinned to the
+  symbol it is about, versioned against commits, and marked **STALE** the
+  moment the code under it changes. Agents read files with those notes
+  inlined; nothing is written into the human tree. See
+  [Gloss](#gloss--memory-pinned-to-code).
 - **Recovery** — a dead agent's thread becomes an **orphan**: goal, acceptance
   criteria, and a seconds-old checkpoint attached, claimable by anyone. That
   is schedulable work, not a mystery dangling branch.
@@ -185,6 +190,149 @@ The tool flow an agent follows:
 5. On "fabric moved": `heddle_rebase`, reconcile any conflicts in the worktree,
    stitch, re-propose. `heddle_adopt` picks up orphans (local or a synced
    peer's).
+
+Memory tools (work in any git repo, no `heddle init` needed):
+`heddle_gloss_read` (a file with its notes inlined), `heddle_gloss_add`,
+`heddle_gloss_search`, `heddle_gloss_why`, `heddle_gloss_verify`,
+`heddle_gloss_drop`. `heddle_propose` also takes `learned: [{target, text,
+kind}]`: the moment an agent knows the most is the moment it proposes.
+
+## Gloss — memory pinned to code
+
+Agents forget everything between sessions, so we give them memory files:
+`CLAUDE.md`, `memory/*.md`, a vector store of past chats. Those files have
+three flaws. They are **unanchored**: they don't know which code they
+describe. They are **unversioned**: nothing records what was true when. And
+they **never go stale, they go wrong**: the code changes, the memory doesn't,
+and the next agent trusts it.
+
+A gloss is the marginal note a scribe wrote next to the text. In heddle it is
+a note pinned to a symbol (`src/sync.rs::remote_is_world_readable`) or a line
+span, recording the commit it was written against, who wrote it (agent,
+thread, lease), and a fingerprint of the code under it.
+
+```console
+$ heddle gloss add 'src/sync.rs::remote_is_world_readable' --kind why \
+    "Probes with NO -h flag: -h restricts ls-remote to branch heads, HEAD isn't one,
+     and the empty result read as 'could not tell', so the public-repo guard never fired."
+g9e43a5b pinned to src/sync.rs::remote_is_world_readable @ d09cd5d0
+
+$ heddle gloss read src/sync.rs          # what an agent sees (MCP: heddle_gloss_read)
+      ┆ // [gloss g9e43a5b · why · claude-auth-refactor · written @d09cd5d0 · fresh]
+      ┆ //   Probes with NO -h flag: -h restricts ls-remote to branch heads, ...
+ 1124  │ /// Ask the remote **with every credential path shut off**. If it still answers,
+```
+
+Weeks later a different agent "tidies" the call and adds `-h` back:
+
+```console
+$ heddle gloss check
+g9e43a5b STALE     src/sync.rs:1126 [why] Probes with NO -h flag: -h restricts …
+1 note(s): 0 fresh, 0 moved, 1 stale, 0 orphaned
+
+$ heddle gloss why src/sync.rs::remote_is_world_readable
+src/sync.rs:1126-1171
+  g9e43a5b [why] STALE — claude-auth-refactor @ d09cd5d0
+      Probes with NO -h flag: ...
+  commits touching these lines (newest first):
+    d040875 2026-10-26 tidy ls-remote flags
+    0818339 2026-07-26 Refuse to publish work-in-progress to a repo anyone can read
+```
+
+The note didn't silently turn into a lie. It says the code changed under it,
+and the agent reading it sees the warning inline, right above the line it is
+about to edit. Someone who reads the code then runs `gloss verify <id>`
+(rebaseline it, optionally with corrected text) or `gloss drop <id>` (retire
+it; it stays in `why` and in the history).
+
+**Why this beats memory files**
+
+| | CLAUDE.md / memory files | gloss |
+|---|---|---|
+| knows which code it describes | no | symbol path, line span, content fingerprint |
+| survives refactors | n/a | re-found by symbol, then exact text, then fuzzy match; renamed files are followed |
+| tells you when it's wrong | never | `STALE` the moment the code under it changes; whitespace-only edits don't count |
+| history | whatever git blame on the .md says | every add/verify/move/drop is a commit on `refs/gloss/notes`; `gloss why` joins notes with `git log -L` |
+| shown where it matters | loaded in full every session | inline above the code, only when that file is read |
+| searchable | grep | BM25 over notes + code; fused with local embeddings when Ollama is up |
+| private | committed and pushed with everything | local refs: not carried by an ordinary `git push`, a clone or `heddle sync` (only `--mirror` or an explicit `refs/*` refspec would); secrets refused |
+
+**How it's built**
+
+- **No shadow copy to strip.** Writing comments into a mirror and stripping
+  them for humans needs a stripper per language, can't tell an agent note
+  from a human comment, and needs a 3-way re-placement whenever a human
+  edits the mirror. Gloss stores notes beside the code, so the human tree is
+  never touched. The "LLM copy" is rendered on read in the file's own
+  comment syntax. For tools that only read plain files, `heddle gloss
+  materialize` writes `refs/gloss/llm` (HEAD with notes inlined; only
+  annotated files are re-rendered, every other blob is reused) and you can
+  `git worktree add` it.
+- **Anchors.** A small outliner (brace matching for C-family, Rust, Go, JS/TS
+  and Java-likes; indentation for Python) gives symbol paths like
+  `Heddle::stitch` or `Server::Serve`. It isn't tree-sitter, on purpose: that
+  would add a C toolchain and one grammar crate per language to a crate
+  whose dependencies are serde, sha2 and hex. A missed symbol costs
+  precision, never correctness, because staleness is decided by the content
+  fingerprint, not by the symbol.
+- **Storage.** `refs/gloss/notes` is a commit chain whose tree holds one JSON
+  file per annotated path. Writes are compare-and-swap on the ref with
+  jittered retry. Worktrees share refs, so every heddle thread sees the same
+  notes. `gloss sync <remote>` is the opt-in way to share them: it merges by
+  note id and refuses world-readable remotes, the same rule `heddle sync`
+  applies.
+- **Code index.** An LSM-style BM25 index keyed by git blob id. Only blobs it
+  hasn't seen are read and tokenized, so a commit costs what it changed.
+  Segments are immutable, liveness is a bitmap, and compaction rewrites
+  postings without touching git. Search reads only the queried terms'
+  postings. It lives in `~/.heddle/gloss/<repo>/`, is rebuildable, and
+  refreshes itself when HEAD moves.
+- **Semantic ranking** comes from a loopback-only Ollama (`nomic-embed-text`
+  by default, `HEDDLE_EMBED_MODEL` to change it, `HEDDLE_EMBED=off` to
+  disable). An `OLLAMA_HOST` that isn't loopback is ignored. Vectors are
+  cached by content hash, so a note or chunk is embedded once until it
+  changes. With no model available, everything falls back to BM25 and the
+  output says `ranker: bm25`.
+
+**Numbers on the Linux kernel**: `git clone --depth 1 torvalds/linux`
+(d135ab45), 24 cores, release build. Reproduce the index numbers with
+`cargo run --release --example gloss_bench [repo]`.
+
+| | |
+|---|---|
+| tree | 97,152 files, 1.19 GB of text (122 binary/oversize blobs skipped) |
+| full code index, cold | **4.9–5.4 s**: 96,392 blobs → 873,422 chunks; peak RSS 1.6 GB |
+| index on disk | **331 MB** (0.28× the text) |
+| refresh, HEAD unchanged | **6–8 ms** |
+| refresh after a 5-file commit | **154–184 ms** (5 blobs re-read, not 96k) |
+| compaction (40%+ dead chunks) | 0.78 s, zero git reads |
+| code search, warm | **p50 9.4 ms, p95 ≤ 11.8 ms** (10 queries × 5 rounds) |
+| `gloss search` end to end, 1,952 notes | 50–80 ms BM25 only; 120–150 ms with embeddings (8.2 s once, cold, to embed every note) |
+| `gloss read kernel/sched/core.c` (11,365 lines) | < 10 ms |
+| `gloss add` | ~25 ms; 2,000 adds from 8 concurrent writers in 51 s, **0 lost** |
+| `gloss check`, 1,950 notes | 0.12–0.14 s (after a 5-file commit: exactly the 4 notes on edited files go STALE) |
+| `gloss materialize`, 1,950 annotated files | 0.6–1.2 s (3 git processes total, however many files) |
+
+**Known gaps, stated plainly**
+
+- The outliner is a heuristic. It misses JS/TS class methods written without
+  a keyword (`foo() {`), macro-generated C functions, and languages outside
+  the families above. Those still anchor by line span and content
+  fingerprint.
+- Code embeddings only *re-rank* the top lexical candidates; there is no
+  full semantic index of the code. Embedding 873k chunks on one machine is
+  hours of work for little gain over BM25 plus re-ranking. Notes are always
+  fully embedded.
+- A note written in a thread's worktree, against code that hasn't landed,
+  reads as STALE from the main checkout until that code lands. That's
+  correct, but it can surprise you.
+- Spans under 3 non-blank lines are only re-found elsewhere when their
+  neighboring lines moved with them. Otherwise an edit reads as STALE at
+  the old spot, never as "moved" onto a lookalike line. The price: a
+  one-liner whose neighbors changed in the same edit goes STALE even if it
+  only moved.
+- `gloss sync` merges per note, last writer wins (by its latest
+  verify/retire time). Concurrent edits to the *same* note keep one side.
 
 ## Work with a friend in 5 minutes
 
@@ -318,6 +466,7 @@ the same per-thread branch — review an agent's in-flight work with plain
 | rung | status |
 |---|---|
 | Several agents, one machine | shipped — worktree isolation, leases, green gate, orphans, configurable git bridge + draft-branch export, honest savings metrics, zero-config agent enrollment (72 tests) |
+| Memory that survives sessions (`heddle gloss`) | shipped — anchored, versioned notes with honest staleness; inline LLM view; incremental blob-keyed BM25 + local-embedding search, benchmarked on the Linux kernel |
 | A few people/machines, one shared git remote | shipped — `heddle sync`: state over `refs/heddle/*`, CAS fabric ref, cross-machine adoption claims; metadata is unsigned (machine ids are identity, not authentication) |
 | Team knobs (consent dials, envelopes) | exists in the Aether integration, which embeds this crate; the generic mailbox namespace here is the hook it rides on |
 | Many peers, no blessed remote (gossip) | design only — see [docs/DESIGN.md](docs/DESIGN.md), "Federation" |
