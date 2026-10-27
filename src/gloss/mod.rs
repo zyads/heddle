@@ -28,9 +28,10 @@
 //! ```
 //!
 //! **Privacy.** The refs live outside `refs/heads`, `refs/tags` and
-//! `refs/heddle/*` — so `git push`, `git push --mirror`-less pushes, clones
-//! and `heddle sync` (which fetches `refs/heddle/*` with `--prune`, and would
-//! delete anything local it does not see remotely) never touch them. Sharing
+//! `refs/heddle/*` — so an ordinary `git push`, a clone, and `heddle sync`
+//! (which fetches `refs/heddle/*` with `--prune`, and would delete anything
+//! local it does not see remotely) never touch them. Only `git push
+//! --mirror` or an explicit `refs/*` refspec would carry them. Sharing
 //! notes is an explicit `heddle gloss sync <remote>`, which refuses a
 //! world-readable remote. Notes are scanned for secrets before they are
 //! stored ([`secrets`]); embeddings only ever talk to a loopback Ollama.
@@ -96,6 +97,14 @@ pub struct Note {
     #[serde(default)]
     pub dirty: bool,
     pub created_at: u64,
+    /// Last change of any kind (add, verify, move, drop, re-anchor): what
+    /// `sync` compares to keep the newer copy of a note.
+    #[serde(default)]
+    pub updated_at: u64,
+    /// Commit the anchor was last placed at. Rename detection diffs from
+    /// here, so a note that already followed one rename can follow the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored_at: Option<String>,
     /// Each time someone confirmed the note still holds (newest last, capped).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified: Vec<Verification>,
@@ -129,7 +138,7 @@ pub struct NoteView {
 
 impl NoteView {
     pub fn of(n: &Note, r: Option<&Resolution>) -> NoteView {
-        let short = |c: &str| c[..c.len().min(12)].to_string();
+        let short = |c: &str| short(c, 12);
         NoteView {
             id: n.id.clone(),
             kind: n.kind.clone(),
@@ -391,7 +400,10 @@ where
                     continue;
                 }
                 if notes.is_empty() {
-                    info.push_str(&format!("0 {}\t{}\n", "0".repeat(40), tree_path(path)));
+                    // Mode 0 removes the path; the oid must still be the repo's
+                    // hash length (sha256 repos reject a 40-char one).
+                    let zero = "0".repeat(old.as_ref().map_or(40, |o| o.len()));
+                    info.push_str(&format!("0 {zero}\t{}\n", tree_path(path)));
                 } else {
                     let json = serde_json::to_string_pretty(notes).map_err(|e| e.to_string())?;
                     let oid = git_io(&repo.root, &["hash-object", "-w", "--stdin"], Some(json.as_bytes()), &[])?;
@@ -421,6 +433,12 @@ where
 // ---------------------------------------------------------------------------
 // Targets: `path`, `path:12`, `path:12-30`, `path::Sym::name`
 // ---------------------------------------------------------------------------
+
+/// First `n` chars of a commit id — by chars, since ids can arrive from a
+/// synced peer's JSON and must never panic a byte slice.
+pub fn short(c: &str, n: usize) -> String {
+    c.chars().take(n).collect()
+}
 
 pub fn now_ms() -> u64 {
     crate::now_ms()
@@ -467,7 +485,11 @@ pub fn target(repo: &Repo, spec: &str) -> Result<Anchor, String> {
             if a > n {
                 return Err(format!("{path} has {n} lines; line {a} does not exist"));
             }
-            Ok(anchor::anchor_span(&path, &content, a, b.min(n), None))
+            let anc = anchor::anchor_span(&path, &content, a, b.min(n), None);
+            if anc.lines.is_empty() {
+                return Err(format!("{path}:{a}-{b} is blank — target the code the note is about"));
+            }
+            Ok(anc)
         }
         (None, None) => Ok(anchor::anchor_file(&path)),
     }
@@ -479,11 +501,21 @@ pub fn target(repo: &Repo, spec: &str) -> Result<Anchor, String> {
 
 fn note_id(seed: &str) -> String {
     let h = crate::store::content_hash(format!("{seed}{}{}", now_ms(), std::process::id()).as_bytes());
-    format!("g{}", &h[..7])
+    // 12 hex = 48 bits: a collision (which would make an id ambiguous
+    // forever) stays negligible even at millions of notes.
+    format!("g{}", &h[..12])
 }
 
+/// Does the file on disk differ from HEAD? Compared by blob hash rather
+/// than `git diff`, which refreshes (and briefly locks) the human's index.
 fn file_dirty(repo: &Repo, path: &str) -> bool {
-    repo.git(&["diff", "--quiet", "HEAD", "--", path]).is_err()
+    let disk = repo.git(&["hash-object", "--", path]);
+    let head = repo.git(&["rev-parse", "-q", "--verify", &format!("HEAD:{path}")]);
+    match (disk, head) {
+        (Ok(d), Ok(h)) => d.trim() != h.trim(),
+        (Ok(_), Err(_)) => true, // not committed yet
+        _ => false,              // not on disk: reading HEAD's copy
+    }
 }
 
 /// Add a note at `spec`. Refuses secrets, empty text, unknown kinds, and
@@ -511,6 +543,8 @@ pub fn add(repo: &Repo, spec: &str, text: &str, kind: &str, author: Author) -> R
         dirty: file_dirty(repo, &path),
         commit: repo.head(),
         created_at: now_ms(),
+        updated_at: now_ms(),
+        anchored_at: None,
         verified: vec![],
         retired: None,
         author,
@@ -605,6 +639,8 @@ pub fn verify(repo: &Repo, id: &str, by: &str, new_text: Option<&str>) -> Result
             n.text = t.trim().to_string();
         }
         n.dirty = file_dirty(repo, &path);
+        n.updated_at = now_ms();
+        n.anchored_at = Some(commit.clone());
         n.verified.push(Verification { commit: commit.clone(), at: now_ms(), by: by.to_string() });
         if n.verified.len() > 10 {
             n.verified.remove(0);
@@ -628,6 +664,8 @@ pub fn move_note(repo: &Repo, id: &str, spec: &str, by: &str) -> Result<Note, St
             .and_then(|l| l.iter().position(|n| n.id == note.id).map(|i| l.remove(i)))
             .ok_or("note vanished mid-update")?;
         n.anchor = anchor.clone();
+        n.updated_at = now_ms();
+        n.anchored_at = Some(commit.clone());
         n.verified.push(Verification { commit: commit.clone(), at: now_ms(), by: by.to_string() });
         out = n.clone();
         set.entry(new_path.clone()).or_default().push(n);
@@ -644,6 +682,7 @@ pub fn drop_note(repo: &Repo, id: &str, by: &str, reason: &str) -> Result<Note, 
     mutate(repo, std::slice::from_ref(&path), &format!("gloss drop {}", note.id), |set| {
         let list = set.entry(path.clone()).or_default();
         let n = list.iter_mut().find(|n| n.id == note.id).ok_or("note vanished mid-update")?;
+        n.updated_at = now_ms();
         n.retired = Some(Retired { at: now_ms(), by: by.to_string(), reason: crate::cap(reason, 300) });
         out = n.clone();
         // Bound the retired tail; the commit log keeps the rest.
@@ -707,7 +746,8 @@ pub fn check(repo: &Repo, prefix: Option<&str>, fix: bool) -> Result<Vec<Checked
             let (res, renamed_to) = match &content {
                 Some(c) => (anchor::resolve(&n.anchor, c), None),
                 None => {
-                    let renames = rename_cache.entry(n.commit.clone()).or_insert_with(|| renames_since(repo, &n.commit));
+                    let base = n.anchored_at.clone().unwrap_or_else(|| n.commit.clone());
+                    let renames = rename_cache.entry(base.clone()).or_insert_with(|| renames_since(repo, &base));
                     match renames.get(path).and_then(|np| repo.content(np).map(|c| (np.clone(), c))) {
                         Some((np, c)) => {
                             let mut r = anchor::resolve(&n.anchor, &c);
@@ -724,6 +764,7 @@ pub fn check(repo: &Repo, prefix: Option<&str>, fix: bool) -> Result<Vec<Checked
         }
     }
     if fix {
+        let head = repo.head();
         let movable: Vec<&Checked> = out
             .iter()
             .filter(|c| matches!(c.resolution.status, Status::Moved { .. }) || (c.renamed_to.is_some() && c.resolution.status.trustworthy()))
@@ -743,6 +784,8 @@ pub fn check(repo: &Repo, prefix: Option<&str>, fix: bool) -> Result<Vec<Checked
                     let Some(list) = set.get_mut(&c.path) else { continue };
                     let Some(i) = list.iter().position(|n| n.id == c.note.id) else { continue };
                     let mut n = list.remove(i);
+                    n.updated_at = now_ms();
+                    n.anchored_at = Some(head.clone());
                     n.anchor = if n.anchor.is_file_level() {
                         anchor::anchor_file(&dest)
                     } else {
@@ -844,11 +887,18 @@ pub fn materialize(repo: &Repo) -> Result<(String, usize), String> {
         // Batched end to end — one cat-file for every annotated file's
         // content, one hash-object for every rendered result — so cost is
         // three git processes total, not three per file.
-        let paths: Vec<&String> = all.iter().filter(|(_, ns)| ns.iter().any(|n| n.retired.is_none())).map(|(p, _)| p).collect();
+        // Paths with a newline would break cat-file/index-info framing; such
+        // files are left as HEAD has them.
+        let paths: Vec<&String> = all
+            .iter()
+            .filter(|(p, ns)| !p.contains('\n') && ns.iter().any(|n| n.retired.is_none()))
+            .map(|(p, _)| p)
+            .collect();
         let specs: Vec<String> = paths.iter().map(|p| format!("{head}:{p}")).collect();
         let stage = temp_index(repo, "llm-stage");
         std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
         let mut staged: Vec<(&String, PathBuf)> = Vec::new();
+        let stage_result = (|| -> Result<(), String> {
         for (i, (path, body)) in paths.iter().zip(cat_batch(repo, &specs)).enumerate() {
             let Some(body) = body else { continue }; // annotated but not in HEAD (uncommitted file)
             let content = String::from_utf8_lossy(&body);
@@ -861,6 +911,12 @@ pub fn materialize(repo: &Repo) -> Result<(String, usize), String> {
             let f = stage.join(i.to_string());
             std::fs::write(&f, text).map_err(|e| e.to_string())?;
             staged.push((path, f));
+        }
+        Ok(())
+        })();
+        if let Err(e) = stage_result {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(e);
         }
         let list: String = staged.iter().map(|(_, f)| format!("{}\n", f.display())).collect();
         let oids = git_io(&repo.root, &["hash-object", "-w", "--no-filters", "--stdin-paths"], Some(list.as_bytes()), &[]);
@@ -908,28 +964,52 @@ pub fn sync(repo: &Repo, remote: &str, anyway: bool) -> Result<(usize, usize), S
              dead ends. Pass --anyway if you really mean to publish them."
         ));
     }
-    let theirs_ref = format!("refs/gloss/remotes/{remote}/notes");
-    let fetched = repo
-        .git(&["fetch", "--quiet", remote, &format!("+{NOTES_REF}:{theirs_ref}")])
-        .is_ok();
+    // Tracking ref: a configured remote's name as-is; a URL or path gets a
+    // hash (it is not a valid ref component).
+    let named = repo.git(&["remote"]).map(|r| r.lines().any(|l| l == remote)).unwrap_or(false);
+    let key = if named { remote.to_string() } else { format!("url-{}", &crate::store::content_hash(remote.as_bytes())[..16]) };
+    let theirs_ref = format!("refs/gloss/remotes/{key}/notes");
+    // Ask first, so "the remote has no notes yet" and "could not reach the
+    // remote" are different answers.
+    let listed = repo
+        .git(&["ls-remote", remote, NOTES_REF])
+        .map_err(|e| format!("cannot reach '{remote}': {e}"))?;
+    let has_theirs = !listed.trim().is_empty();
     let mut merged_in = 0;
-    if fetched {
+    if has_theirs {
+        repo.git(&["fetch", "--quiet", remote, &format!("+{NOTES_REF}:{theirs_ref}")])?;
         let theirs = load_all_at(repo, &theirs_ref);
-        let paths: Vec<String> = theirs.keys().cloned().collect();
-        mutate(repo, &paths, &format!("gloss sync: merge {remote}"), |set| {
+        // Notes are matched by id across ALL paths: a note that moved with a
+        // rename on one side must replace, not duplicate, the other copy.
+        let ids: std::collections::HashSet<&str> = theirs.values().flatten().map(|n| n.id.as_str()).collect();
+        let mut paths: Vec<String> = theirs.keys().cloned().collect();
+        for (p, ns) in load_all(repo) {
+            if ns.iter().any(|n| ids.contains(n.id.as_str())) {
+                paths.push(p);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let stamp = |n: &Note| {
+            n.updated_at
+                .max(n.created_at)
+                .max(n.verified.last().map_or(0, |v| v.at))
+                .max(n.retired.as_ref().map_or(0, |r| r.at))
+        };
+        mutate(repo, &paths, &format!("gloss sync: merge {key}"), |set| {
             merged_in = 0;
-            for (path, tnotes) in &theirs {
-                let mine = set.entry(path.clone()).or_default();
+            for (tpath, tnotes) in &theirs {
                 for t in tnotes {
-                    let stamp = |n: &Note| n.verified.last().map_or(n.created_at, |v| v.at).max(n.retired.as_ref().map_or(0, |r| r.at));
-                    match mine.iter_mut().find(|m| m.id == t.id) {
-                        Some(m) if stamp(t) > stamp(m) => {
-                            *m = t.clone();
+                    let here = set.iter().find_map(|(p, ns)| ns.iter().position(|n| n.id == t.id).map(|i| (p.clone(), i)));
+                    match here {
+                        Some((p, i)) if stamp(t) > stamp(&set[&p][i]) => {
+                            set.get_mut(&p).expect("found above").remove(i);
+                            set.entry(tpath.clone()).or_default().push(t.clone());
                             merged_in += 1;
                         }
                         Some(_) => {}
                         None => {
-                            mine.push(t.clone());
+                            set.entry(tpath.clone()).or_default().push(t.clone());
                             merged_in += 1;
                         }
                     }
@@ -941,7 +1021,7 @@ pub fn sync(repo: &Repo, remote: &str, anyway: bool) -> Result<(usize, usize), S
     let total: usize = load_all(repo).values().map(|v| v.len()).sum();
     // Ours is now a union, not a descendant of theirs, so the push replaces
     // their ref — guarded by a lease on exactly what we merged.
-    let lease = if fetched {
+    let lease = if has_theirs {
         let t = repo.git(&["rev-parse", &theirs_ref])?;
         format!("--force-with-lease={NOTES_REF}:{}", t.trim())
     } else {
@@ -971,6 +1051,9 @@ pub struct SearchResult {
     pub ranker: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexInfo>,
+    /// Set when the code half degraded (index busy/corrupt); notes still answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -994,11 +1077,14 @@ pub fn search(repo: &Repo, data_dir: &Path, query: &str, k: usize) -> Result<Sea
     let code_dir = cache.join("code");
     let head = repo.head();
     let mut info = None;
+    let mut warning = None;
     if !head.is_empty() {
         let t0 = std::time::Instant::now();
         let refreshed = index::indexed_commit(&code_dir).as_deref() != Some(head.as_str());
         if refreshed {
-            index::update(&repo.root, &code_dir, "HEAD")?;
+            if let Err(e) = index::update(&repo.root, &code_dir, "HEAD") {
+                warning = Some(format!("code index refresh failed ({e}); code hits may lag HEAD"));
+            }
         }
         info = Some(IndexInfo { commit: head.clone(), refreshed, refresh_ms: t0.elapsed().as_millis() as u64 });
     }
@@ -1014,7 +1100,23 @@ pub fn search(repo: &Repo, data_dir: &Path, query: &str, k: usize) -> Result<Sea
         .map(|(p, n)| index::tokenize(&format!("{} {} {} {}", n.text, n.kind, p, n.anchor.symbol.clone().unwrap_or_default())))
         .collect();
     let lex = index::bm25_rank(&docs, &qtok);
-    let mut code = if head.is_empty() { vec![] } else { index::search(&code_dir, query, (k * 3).max(30))? };
+    // A broken cache must never take the notes down with it: retry once
+    // after a rebuild, then answer without code hits.
+    let want = (k * 3).max(30);
+    let mut code = if head.is_empty() {
+        vec![]
+    } else {
+        match index::search(&code_dir, query, want) {
+            Ok(c) => c,
+            Err(_) => match index::update(&repo.root, &code_dir, "HEAD").and_then(|_| index::search(&code_dir, query, want)) {
+                Ok(c) => c,
+                Err(e) => {
+                    warning = Some(format!("code search unavailable: {e}"));
+                    vec![]
+                }
+            },
+        }
+    };
 
     let embedder = embed::Embedder::local(&cache);
     let mut ranker = "bm25".to_string();
@@ -1057,7 +1159,7 @@ pub fn search(repo: &Repo, data_dir: &Path, query: &str, k: usize) -> Result<Sea
             NoteHit { path: p.clone(), note: NoteView::of(n, r.as_ref()), score }
         })
         .collect();
-    Ok(SearchResult { notes, code, ranker, index: info })
+    Ok(SearchResult { notes, code, ranker, index: info, warning })
 }
 
 /// Reciprocal rank fusion of two ranked lists over `n` items.

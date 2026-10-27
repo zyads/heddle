@@ -191,7 +191,7 @@ fn tools() -> Value {
                 code is shaped this way, an invariant that is not written down, a gotcha, an \
                 approach that failed. Target: `path`, `path:12-30`, or `path::Type::method` (best: \
                 symbols survive moves). Records your commit and identity; the note goes STALE if \
-                that code later changes. Stored locally in refs/gloss/notes, never pushed. Text \
+                that code later changes. Stored locally in refs/gloss/notes; an ordinary git push never carries it. Text \
                 that looks like a secret is refused. Keep it to what the code cannot say itself.",
             "inputSchema": {"type": "object", "properties": {
                 "target": {"type": "string"},
@@ -513,7 +513,7 @@ fn gloss_call(name: &str, args: &Value) -> Result<String, String> {
             let author = gloss::Author { by: holder(), thread: None, lease: None };
             let n = gloss::add(&repo, need("target")?, need("text")?, kind, author)?;
             Ok(json!({"id": n.id, "anchor": n.anchor.label(), "commit": n.commit, "dirty": n.dirty,
-                      "note": "stored locally in refs/gloss/notes (never pushed by git push or heddle sync)"})
+                      "note": "stored locally in refs/gloss/notes (not carried by an ordinary git push, a clone, or heddle sync)"})
                 .to_string())
         }
         "heddle_gloss_search" => {

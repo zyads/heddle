@@ -40,7 +40,8 @@ heddle gloss — notes for the next agent, anchored to the code they describe
   gloss sync <remote> [--anyway]               opt-in: share notes with a remote
                                               (refuses world-readable remotes)
 
-Notes live in refs/gloss/notes — never pushed by git push or heddle sync.";
+Notes live in refs/gloss/notes — not carried by an ordinary git push, a clone or heddle sync
+(only `git push --mirror` or an explicit refs/* refspec would).";
 
 fn flag(rest: &[String], name: &str) -> Option<String> {
     rest.iter().position(|a| a == name).and_then(|i| rest.get(i + 1).cloned())
@@ -240,6 +241,9 @@ pub fn run(rest: &[String]) -> Result<(), String> {
                 println!("{}", serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?);
                 return Ok(());
             }
+            if let Some(w) = &res.warning {
+                eprintln!("gloss: {w}");
+            }
             if let Some(i) = &res.index {
                 if i.refreshed {
                     eprintln!("gloss: code index refreshed to {} in {} ms", short(&i.commit), i.refresh_ms);
@@ -292,8 +296,8 @@ pub fn run(rest: &[String]) -> Result<(), String> {
     }
 }
 
-fn short(c: &str) -> &str {
-    &c[..c.len().min(8)]
+fn short(c: &str) -> String {
+    gloss::short(c, 8)
 }
 
 fn age(ms: u64) -> String {

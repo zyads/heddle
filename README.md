@@ -255,7 +255,7 @@ it; it stays in `why` and in the history).
 | history | whatever git blame on the .md says | every add/verify/move/drop is a commit on `refs/gloss/notes`; `gloss why` joins notes with `git log -L` |
 | shown where it matters | loaded in full every session | inline above the code, only when that file is read |
 | searchable | grep | BM25 over notes + code; fused with local embeddings when Ollama is up |
-| private | committed and pushed with everything | local refs, never pushed by `git push` or `heddle sync`; secrets refused |
+| private | committed and pushed with everything | local refs: not carried by an ordinary `git push`, a clone or `heddle sync` (only `--mirror` or an explicit `refs/*` refspec would); secrets refused |
 
 **How it's built**
 
@@ -307,11 +307,11 @@ it; it stays in `why` and in the history).
 | refresh after a 5-file commit | **154–184 ms** (5 blobs re-read, not 96k) |
 | compaction (40%+ dead chunks) | 0.78 s, zero git reads |
 | code search, warm | **p50 9.4 ms, p95 ≤ 11.8 ms** (10 queries × 5 rounds) |
-| `gloss search` end to end, 1,952 notes | 80 ms BM25 only; 150 ms with embeddings (8.2 s once, cold, to embed every note) |
-| `gloss read kernel/sched/core.c` (11,365 lines) | ~10 ms |
+| `gloss search` end to end, 1,952 notes | 50–80 ms BM25 only; 120–150 ms with embeddings (8.2 s once, cold, to embed every note) |
+| `gloss read kernel/sched/core.c` (11,365 lines) | < 10 ms |
 | `gloss add` | ~25 ms; 2,000 adds from 8 concurrent writers in 51 s, **0 lost** |
-| `gloss check`, 1,950 notes | 0.12 s (after a 5-file commit: exactly the 4 notes on edited files go STALE) |
-| `gloss materialize`, 1,950 annotated files | 1.2 s |
+| `gloss check`, 1,950 notes | 0.12–0.14 s (after a 5-file commit: exactly the 4 notes on edited files go STALE) |
+| `gloss materialize`, 1,950 annotated files | 0.6–1.2 s (3 git processes total, however many files) |
 
 **Known gaps, stated plainly**
 
@@ -326,6 +326,11 @@ it; it stays in `why` and in the history).
 - A note written in a thread's worktree, against code that hasn't landed,
   reads as STALE from the main checkout until that code lands. That's
   correct, but it can surprise you.
+- Spans under 3 non-blank lines are only re-found elsewhere when their
+  neighboring lines moved with them. Otherwise an edit reads as STALE at
+  the old spot, never as "moved" onto a lookalike line. The price: a
+  one-liner whose neighbors changed in the same edit goes STALE even if it
+  only moved.
 - `gloss sync` merges per note, last writer wins (by its latest
   verify/retire time). Concurrent edits to the *same* note keep one side.
 

@@ -31,7 +31,7 @@ pub fn comment_style(path: &str) -> (&'static str, &'static str) {
 /// The one-line header for a note: id, kind, author, commit, trust state.
 pub fn header(n: &Note, r: &Resolution) -> String {
     let commit = n.verified.last().map(|v| v.commit.as_str()).unwrap_or(n.commit.as_str());
-    let short = &commit[..commit.len().min(8)];
+    let short = super::short(commit, 8);
     let when = if n.verified.is_empty() { "written" } else { "verified" };
     let state = match &r.status {
         Status::Fresh => "fresh".to_string(),

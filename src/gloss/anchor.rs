@@ -36,6 +36,9 @@ pub const MAX_LINE_HASHES: usize = 400;
 /// Share of the original lines a window must keep to count as "the same code,
 /// edited" rather than "gone".
 pub const FUZZY_THRESHOLD: f32 = 0.5;
+/// Spans shorter than this (in non-blank lines) are never relocated by
+/// content: short lines repeat too often to say a copy is "the same code".
+pub const MIN_RELOCATE_LINES: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Anchor {
@@ -54,6 +57,11 @@ pub struct Anchor {
     /// Normalized per-line hashes (capped at [`MAX_LINE_HASHES`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<u32>,
+    /// Short spans only: hashes of the nearest non-blank line before and
+    /// after (0 = none). A one-line span can only be re-found elsewhere if
+    /// its neighbors came with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ctx: Vec<u32>,
 }
 
 impl Anchor {
@@ -158,18 +166,20 @@ pub fn anchor_span(path: &str, content: &str, start: usize, end: usize, symbol: 
         e -= 1;
     }
     let span = lines.get(s - 1..e).unwrap_or(&[]);
-    Anchor {
-        path: path.to_string(),
-        symbol,
-        start: s,
-        end: e,
-        span_hash: span_hash(span),
-        lines: significant(span).into_iter().map(|(_, h)| h).take(MAX_LINE_HASHES).collect(),
-    }
+    let hashes: Vec<u32> = significant(span).into_iter().map(|(_, h)| h).take(MAX_LINE_HASHES).collect();
+    let ctx = if hashes.len() < MIN_RELOCATE_LINES { context(&lines, s, e) } else { vec![] };
+    Anchor { path: path.to_string(), symbol, start: s, end: e, span_hash: span_hash(span), lines: hashes, ctx }
 }
 
 pub fn anchor_file(path: &str) -> Anchor {
-    Anchor { path: path.to_string(), symbol: None, start: 0, end: 0, span_hash: String::new(), lines: vec![] }
+    Anchor { path: path.to_string(), symbol: None, start: 0, end: 0, span_hash: String::new(), lines: vec![], ctx: vec![] }
+}
+
+/// [before, after] neighbor hashes around 1-based `s..=e`.
+fn context(lines: &[&str], s: usize, e: usize) -> Vec<u32> {
+    let before = lines[..s.saturating_sub(1).min(lines.len())].iter().rev().find(|l| !l.trim().is_empty());
+    let after = lines.get(e..).unwrap_or(&[]).iter().find(|l| !l.trim().is_empty());
+    vec![before.map_or(0, |l| line_hash(l)), after.map_or(0, |l| line_hash(l))]
 }
 
 /// Re-find `a` in `content`. Pure: never writes anything.
@@ -196,8 +206,8 @@ pub fn resolve(a: &Anchor, content: &str) -> Resolution {
     }
 
     // 2. Exact: a run of k significant lines with the same hashes, then
-    //    confirmed by the sha256 span hash. Closest to the old spot wins.
-    let mut best: Option<(usize, usize, usize)> = None; // (distance, start, end)
+    //    confirmed by the sha256 span hash.
+    let mut matches: Vec<(usize, usize)> = Vec::new();
     if sig.len() >= k {
         for w in 0..=sig.len() - k {
             if sig[w].1 != a.lines[0] || sig[w..w + k].iter().map(|x| x.1).ne(a.lines.iter().copied()) {
@@ -208,17 +218,39 @@ pub fn resolve(a: &Anchor, content: &str) -> Resolution {
                 // Capped fingerprint: extend to the original span length.
                 e = (s + (a.end - a.start)).min(lines.len());
             }
-            if span_hash(&lines[s - 1..e]) != a.span_hash {
-                continue;
-            }
-            let d = s.abs_diff(a.start);
-            if best.is_none_or(|b| d < b.0) {
-                best = Some((d, s, e));
+            if span_hash(&lines[s - 1..e]) == a.span_hash {
+                matches.push((s, e));
             }
         }
     }
-    if let Some((_, s, e)) = best {
+    if let Some(&(s, e)) = matches.iter().find(|(s, _)| *s == a.start) {
+        return Resolution { status: Status::Fresh, start: s, end: e };
+    }
+    // The code is no longer where it was. A copy elsewhere counts as "moved"
+    // only when it is unmistakably the same code: unique in the file and
+    // more than a couple of lines. `return Ok(());` appearing again thirty
+    // lines down is not where a note about the edited line went — calling
+    // that "moved, fresh" would put a stale note above unrelated code.
+    let distinctive = k >= MIN_RELOCATE_LINES;
+    let candidates: Vec<(usize, usize)> = if distinctive {
+        matches.clone()
+    } else {
+        // Short span: only copies whose neighbors also match.
+        matches.iter().copied().filter(|&(s, e)| a.ctx.len() == 2 && context(&lines, s, e) == a.ctx).collect()
+    };
+    if candidates.len() == 1 {
+        let (s, e) = candidates[0];
         return Resolution { status: moved_or_fresh(s), start: s, end: e };
+    }
+    let here = |status| {
+        let s = a.start.min(lines.len().max(1));
+        Resolution { status, start: s, end: a.end.clamp(s, lines.len().max(1)) }
+    };
+    if !candidates.is_empty() || !matches.is_empty() || !distinctive {
+        // Ambiguous or too short to re-find by content: the honest answer
+        // is "what was here changed" — stale at the old spot (orphaned if
+        // the file no longer reaches that far).
+        return if a.start <= lines.len() { here(Status::Stale) } else { here(Status::Orphaned) };
     }
 
     // 3. Fuzzy: the window of k significant lines sharing the most line
@@ -411,7 +443,11 @@ fn c_function(line: &str, prev: &str) -> Option<String> {
     if head.contains('=') || head.is_empty() {
         return None;
     }
-    let name_start = head.rfind(|c: char| !(c.is_alphanumeric() || c == '_')).map_or(0, |i| i + 1);
+    let name_start = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map_or(0, |(i, c)| i + c.len_utf8());
     let name = &head[name_start..];
     if name.is_empty() {
         return None;
@@ -722,6 +758,27 @@ fn main() {
         let r = resolve(&a, &moved);
         assert_eq!(r.status, Status::Moved { from: 6 });
         assert_eq!(r.start, 7, "the duplicate nearest the old spot wins");
+    }
+
+    #[test]
+    fn edited_short_span_is_stale_not_moved_to_a_lookalike() {
+        let body = "fn transfer() {\n    debit();\n    return Ok(());\n}\nfn ping() {\n    log();\n    return Ok(());\n}\n";
+        let a = anchor_span("t.rs", body, 3, 3, None);
+        assert_eq!(resolve(&a, body).status, Status::Fresh, "duplicate elsewhere, but still here");
+        let edited = body.replacen("return Ok(());", "return Err(E::Retry);", 1);
+        let r = resolve(&a, &edited);
+        assert_eq!(r.status, Status::Stale, "{r:?}");
+        assert_eq!(r.start, 3, "stays at the edited line, not the lookalike on line 7");
+        // A one-liner that merely shifted is also not claimed as moved.
+        let shifted = format!("// header\n{body}");
+        let r = resolve(&a, &shifted);
+        assert_eq!((r.status, r.start), (Status::Moved { from: 3 }, 4), "neighbors came along: a real move");
+    }
+
+    #[test]
+    fn non_ascii_before_a_paren_does_not_panic() {
+        let c = "\u{a9}foo(bar) notice\n\u{a9}x\nint \u{e9}t\u{e9}(void) {\n}\n";
+        let _ = outline("x.c", c);
     }
 
     #[test]

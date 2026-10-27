@@ -172,6 +172,13 @@ fn load_cache(p: &Path) -> HashMap<String, Vec<f32>> {
         m.insert(key, v);
         i = start + d * 4;
     }
+    if i < b.len() {
+        // A torn record (crash mid-append, or two writers interleaving).
+        // Cut it off, or every later append would land behind it unread.
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
+            let _ = f.set_len(i as u64);
+        }
+    }
     m
 }
 
@@ -210,6 +217,9 @@ mod tests {
         assert_eq!(m.get("a"), Some(&vec![1.0, 2.0]));
         assert_eq!(m.get("b"), Some(&vec![3.0]));
         assert_eq!(m.len(), 2);
+        // The torn tail was cut, so new appends are readable again.
+        append_cache(&p, &[("c".into(), vec![4.0])]);
+        assert_eq!(load_cache(&p).get("c"), Some(&vec![4.0]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

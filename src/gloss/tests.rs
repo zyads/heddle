@@ -246,3 +246,84 @@ fn sync_is_opt_in_and_merges_by_id() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+#[test]
+fn a_note_follows_two_renames_in_a_row() {
+    let (dir, repo) = rig("rename2");
+    let n = add(&repo, "src/lib.rs::Cache::evict", "evict is O(1)", "note", me()).unwrap();
+    for (from, to) in [("src/lib.rs", "src/a.rs"), ("src/a.rs", "src/b.rs")] {
+        sh(&dir, &["mv", from, to]);
+        commit_all(&dir, "rename");
+        check(&repo, None, true).unwrap();
+    }
+    let c = check(&repo, None, false).unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!((c[0].path.as_str(), c[0].note.id.as_str()), ("src/b.rs", n.id.as_str()));
+    assert!(c[0].resolution.status.trustworthy(), "{:?}", c[0].resolution);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sync_matches_ids_across_paths_and_takes_url_remotes() {
+    let (dir, repo) = rig("sync2");
+    let bare = dir.with_extension("remote.git");
+    sh(&dir, &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()]);
+    let url = bare.to_string_lossy().to_string();
+    sh(&dir, &["push", "-q", &url, "main"]);
+    let n = add(&repo, "src/lib.rs::Cache::get", "hot path", "note", me()).unwrap();
+    // A path (not a named remote) works, both first time and after.
+    sync(&repo, &url, false).unwrap();
+
+    let b_dir = dir.with_extension("b");
+    sh(&dir, &["clone", "-q", &url, &b_dir.to_string_lossy()]);
+    let b = Repo::open(&b_dir).unwrap();
+    sync(&b, &url, false).unwrap();
+    sh(&b_dir, &["mv", "src/lib.rs", "src/cache.rs"]);
+    commit_all(&b_dir, "rename");
+    check(&b, None, true).unwrap();
+    sync(&b, &url, false).unwrap();
+    sync(&repo, &url, false).unwrap();
+    // A's copy moved to the rename's path; never duplicated under two paths.
+    let all = load_all(&repo);
+    let copies: Vec<&String> = all.iter().filter(|(_, ns)| ns.iter().any(|x| x.id == n.id)).map(|(p, _)| p).collect();
+    assert_eq!(copies, vec!["src/cache.rs"]);
+    assert!(find(&repo, &n.id).is_ok(), "id stays addressable");
+    for d in [&b_dir, &bare, &dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn a_broken_code_index_never_takes_notes_down() {
+    let (dir, repo) = rig("brokenidx");
+    let data = dir.with_extension("data");
+    add(&repo, "src/lib.rs::Cache::get", "lookup counts hits", "note", me()).unwrap();
+    assert!(!search(&repo, &data, "lookup hits", 5).unwrap().notes.is_empty());
+    // Scribble over every segment while the manifest still points at HEAD.
+    let code = repo.cache_dir(&data).join("code");
+    for e in std::fs::read_dir(&code).unwrap().flatten() {
+        if e.file_name().to_string_lossy().ends_with(".seg") {
+            std::fs::write(e.path(), b"garbage").unwrap();
+        }
+    }
+    let r = search(&repo, &data, "lookup hits", 5).unwrap();
+    assert!(!r.notes.is_empty(), "notes still answer");
+    assert!(!r.code.is_empty() || r.warning.is_some(), "rebuilt, or says why not");
+    for d in [&data, &dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn blank_targets_are_refused_and_dirty_check_leaves_the_index_alone() {
+    let (dir, repo) = rig("blank");
+    assert!(add(&repo, "src/lib.rs:4", "x", "note", me()).unwrap_err().contains("blank"));
+    let ix = dir.join(".git/index");
+    let before = std::fs::metadata(&ix).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(dir.join("src/lib.rs"), format!("{LIB}// tail\n")).unwrap();
+    let n = add(&repo, "src/lib.rs::Cache::get", "dirty write", "note", me()).unwrap();
+    assert!(n.dirty);
+    assert_eq!(std::fs::metadata(&ix).unwrap().modified().unwrap(), before, "the human's index is never touched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
