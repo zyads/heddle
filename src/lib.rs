@@ -70,6 +70,7 @@
 pub mod bridge;
 pub mod consent;
 pub mod enroll;
+pub mod gloss;
 pub mod lease;
 pub mod savings;
 pub mod solo;
@@ -3064,7 +3065,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn cap(s: &str, max: usize) -> String {
+pub fn cap(s: &str, max: usize) -> String {
     let t = s.trim();
     if t.chars().count() <= max {
         return t.to_string();

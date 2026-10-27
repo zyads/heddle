@@ -22,7 +22,7 @@ use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
 use heddle::consent::{AutoDeny, WeaveDisposition};
-use heddle::{solo, Heddle};
+use heddle::{gloss, solo, Heddle};
 
 /// Serve MCP over stdio until stdin closes.
 pub fn serve(engine: &Heddle) {
@@ -82,6 +82,16 @@ pub fn serve(engine: &Heddle) {
 fn tools() -> Value {
     let repo_prop = json!({"type": "string", "description":
         "Repo directory (default: the server's working directory). Must already be `heddle init`-ed."});
+    let learned_prop = json!({"type": "array", "description":
+        "What you learned that the next agent should know, pinned to code (optional, but this is \
+         the moment you know it best). Each item: {target: path | path:12-30 | path::Sym, text, \
+         kind?: why|invariant|gotcha|deadend|note}. Stored as gloss notes in your worktree.",
+        "items": {"type": "object", "properties": {
+            "target": {"type": "string"}, "text": {"type": "string"}, "kind": {"type": "string"}},
+            "required": ["target", "text"]}});
+    let gloss_repo_prop = json!({"type": "string", "description":
+        "Directory inside the git repo or thread worktree (default: the server's working directory). \
+         Pass your working_dir when working in a heddle worktree."});
     json!([
         {
             "name": "heddle_status",
@@ -148,6 +158,7 @@ fn tools() -> Value {
                 "thread_id": {"type": "string", "description": "Defaults to the thread whose \
                     worktree contains `repo`, else the repo's ONLY live thread; ambiguous \
                     bare calls are refused with the list."},
+                "learned": learned_prop.clone(),
                 "repo": repo_prop,
             }},
         },
@@ -160,6 +171,77 @@ fn tools() -> Value {
                 "thread_id": {"type": "string"},
                 "repo": repo_prop,
             }, "required": ["thread_id"]},
+        },
+        {
+            "name": "heddle_gloss_read",
+            "description": "Read a file WITH the notes earlier agents pinned to it, interleaved as \
+                comments in the file's own syntax, above the code they describe. Each note says \
+                who wrote it, at which commit, and whether it is fresh or STALE (the code under it \
+                changed since — verify before trusting). Line numbers are the real file's. Prefer \
+                this over a plain read for files you are about to change. Read-only.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "File path (repo-relative or absolute)."},
+                "trusted_only": {"type": "boolean", "description": "Hide STALE/ORPHANED notes (default false: you see them, clearly marked)."},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["path"]},
+        },
+        {
+            "name": "heddle_gloss_add",
+            "description": "Pin what you learned to the code it is about, for the next agent: WHY \
+                code is shaped this way, an invariant that is not written down, a gotcha, an \
+                approach that failed. Target: `path`, `path:12-30`, or `path::Type::method` (best: \
+                symbols survive moves). Records your commit and identity; the note goes STALE if \
+                that code later changes. Stored locally in refs/gloss/notes, never pushed. Text \
+                that looks like a secret is refused. Keep it to what the code cannot say itself.",
+            "inputSchema": {"type": "object", "properties": {
+                "target": {"type": "string"},
+                "text": {"type": "string"},
+                "kind": {"type": "string", "enum": heddle::gloss::KINDS},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["target", "text"]},
+        },
+        {
+            "name": "heddle_gloss_search",
+            "description": "Search pinned notes and the code itself (BM25 over a blob-keyed \
+                incremental index; fused with local embeddings when a loopback Ollama model is \
+                available — nothing leaves the machine). Returns notes with anchors and code \
+                hits with line ranges.",
+            "inputSchema": {"type": "object", "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "description": "Max hits per list (default 8)."},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["query"]},
+        },
+        {
+            "name": "heddle_gloss_why",
+            "description": "\"Why is this like this?\" for a target: every note that covers it \
+                (live, with fresh/STALE state, and retired ones with why they were retired) plus \
+                the commits that touched those lines.",
+            "inputSchema": {"type": "object", "properties": {
+                "target": {"type": "string"},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["target"]},
+        },
+        {
+            "name": "heddle_gloss_verify",
+            "description": "You read the code under a STALE note and it still holds (optionally \
+                with corrected text): rebaseline it to the current code and record the \
+                verification. If it no longer holds, use heddle_gloss_drop instead.",
+            "inputSchema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "text": {"type": "string", "description": "Replacement text (optional)."},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["id"]},
+        },
+        {
+            "name": "heddle_gloss_drop",
+            "description": "Retire a note that is no longer true. It leaves reads but stays in \
+                heddle_gloss_why and the notes history.",
+            "inputSchema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "reason": {"type": "string"},
+                "repo": gloss_repo_prop,
+            }, "required": ["id", "reason"]},
         },
     ])
 }
@@ -318,6 +400,7 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                     (repo, thread.id)
                 }
             };
+            let learned = record_learned(engine, args, &thread_id);
             match engine.propose_with_consent(&thread_id, &AutoDeny)? {
                 WeaveDisposition::Red { weave, .. } => Ok(json!({
                     "verify": "red",
@@ -325,6 +408,7 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                     "log_tail": weave.verify.log_tail,
                     "landed": false,
                     "note": "verify was red — nothing can land; fix and re-propose",
+                    "learned": learned,
                 })
                 .to_string()),
                 WeaveDisposition::Refused { weave, reason, .. } => Ok(json!({
@@ -333,6 +417,7 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                     "landed": false,
                     "reason": reason,
                     "auto_sync": autosync_note(engine, &repo),
+                    "learned": learned,
                     "note": "verified green; NOTHING was applied — landing requires a human at a \
                              terminal: run `heddle propose` there (it re-runs the verify and asks)",
                 })
@@ -368,6 +453,85 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                          materialized in working_dir (when set) — cd there and continue",
             })
             .to_string())
+        }
+        g if g.starts_with("heddle_gloss_") => gloss_call(g, args),
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// Store a propose call's `learned` items as gloss notes, written from the
+/// thread's worktree (so anchors match the code the agent just changed).
+/// Returns per-item outcomes; failures never fail the propose.
+fn record_learned(engine: &Heddle, args: &Value, thread_id: &str) -> Value {
+    let Some(items) = args.get("learned").and_then(|v| v.as_array()) else {
+        return json!("none recorded — pass `learned` next time: what you know now is gone after this session");
+    };
+    let snap = engine.snapshot();
+    let thread = snap.repo_states.values().flat_map(|rs| rs.threads.iter()).find(|t| t.id == thread_id);
+    let dir = thread
+        .and_then(|t| t.worktree.clone())
+        .or_else(|| thread.and_then(|t| snap.repos.iter().find(|r| r.id == t.repo_id)).map(|r| r.path.clone()))
+        .unwrap_or_else(|| ".".into());
+    let Ok(repo) = gloss::Repo::open(&dir) else { return json!("not a git repo — notes need git") };
+    let author = gloss::Author {
+        by: holder(),
+        thread: Some(thread_id.to_string()),
+        lease: thread.and_then(|t| t.lease_id.clone()),
+    };
+    items
+        .iter()
+        .map(|it| {
+            let t = it.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("why");
+            match gloss::add(&repo, t, text, kind, author.clone()) {
+                Ok(n) => json!({"id": n.id, "anchor": n.anchor.label()}),
+                Err(e) => json!({"target": t, "not_stored": e}),
+            }
+        })
+        .collect()
+}
+
+fn gloss_call(name: &str, args: &Value) -> Result<String, String> {
+    let repo = gloss::Repo::open(arg(args, "repo").unwrap_or("."))?;
+    let need = |k: &str| arg(args, k).ok_or_else(|| format!("{name} needs `{k}`"));
+    match name {
+        "heddle_gloss_read" => {
+            let trusted = args.get("trusted_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let opts = gloss::render::RenderOpts { numbers: true, show_untrusted: !trusted };
+            let (text, notes) = gloss::read(&repo, need("path")?, &opts)?;
+            let stale = notes.iter().filter(|(_, r)| !r.status.trustworthy()).count();
+            Ok(if stale > 0 {
+                format!("{text}\n[{stale} note(s) above are STALE/ORPHANED: the code changed since they were written. \
+                         If you confirm one still holds, heddle_gloss_verify it; if not, heddle_gloss_drop it.]")
+            } else {
+                text
+            })
+        }
+        "heddle_gloss_add" => {
+            let kind = arg(args, "kind").unwrap_or("note");
+            let author = gloss::Author { by: holder(), thread: None, lease: None };
+            let n = gloss::add(&repo, need("target")?, need("text")?, kind, author)?;
+            Ok(json!({"id": n.id, "anchor": n.anchor.label(), "commit": n.commit, "dirty": n.dirty,
+                      "note": "stored locally in refs/gloss/notes (never pushed by git push or heddle sync)"})
+                .to_string())
+        }
+        "heddle_gloss_search" => {
+            let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(8).clamp(1, 50) as usize;
+            let res = gloss::search(&repo, &heddle::default_data_dir(), need("query")?, k)?;
+            serde_json::to_string(&res).map_err(|e| e.to_string())
+        }
+        "heddle_gloss_why" => {
+            let w = gloss::why(&repo, need("target")?)?;
+            Ok(w.to_json().to_string())
+        }
+        "heddle_gloss_verify" => {
+            let n = gloss::verify(&repo, need("id")?, &holder(), arg(args, "text"))?;
+            Ok(json!({"id": n.id, "anchor": n.anchor.label(), "verified_at": repo.head()}).to_string())
+        }
+        "heddle_gloss_drop" => {
+            let n = gloss::drop_note(&repo, need("id")?, &holder(), need("reason")?)?;
+            Ok(json!({"id": n.id, "retired": n.retired}).to_string())
         }
         other => Err(format!("unknown tool: {other}")),
     }

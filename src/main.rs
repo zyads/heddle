@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use heddle::consent::{TerminalConsent, WeaveDisposition};
 use heddle::{solo, store, sync, IsolationMode, Heddle, RepoConfig, ThreadStatus};
 
+mod gloss_cli;
 mod mcp;
 
 const USAGE: &str = "\
@@ -83,10 +84,15 @@ usage:
                                               hooks — silent when nothing is
                                               live, silent outside any repo)
   heddle log                                    fabric history + recent events
+  heddle gloss <verb> ...                       notes for the next agent, pinned
+                                              to symbols/lines, versioned, honest
+                                              about going STALE; read a file with
+                                              its notes inlined; search notes +
+                                              code locally (`heddle gloss help`)
   heddle mcp                                    stdio MCP server (heddle_status,
                                               heddle_lease, heddle_stitch,
                                               heddle_propose, heddle_rebase,
-                                              heddle_adopt)
+                                              heddle_adopt, heddle_gloss_*)
 
 bare verbs: flag-less stitch/propose/rebase/export target the thread whose
 worktree you are standing in, else the repo's ONLY live thread. With several
@@ -118,6 +124,7 @@ fn main() -> ExitCode {
         "savings" => cmd_savings(rest),
         "status" => cmd_status(rest),
         "log" => cmd_log(),
+        "gloss" => gloss_cli::run(rest),
         "mcp" => {
             mcp::serve(store());
             Ok(())
@@ -810,6 +817,7 @@ fn cmd_propose(rest: &[String]) -> Result<(), String> {
                 None => {}
             }
             autosync(engine, &repo);
+            gloss_cli::capture_learned(std::path::Path::new(&repo.path), &thread_id);
             Ok(())
         }
     }

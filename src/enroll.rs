@@ -59,6 +59,8 @@ editing, then cd into the printed `WORK IN:` worktree and edit ONLY there.\n\
 3. `heddle stitch --lease <id>` — checkpoint every few edits (heartbeats too).\n\
 4. `heddle export --thread <id>` — your chain onto a review branch.\n   \
 `heddle propose` verifies; landing always waits for a human at a terminal.\n\
+5. `heddle gloss read <file>` shows notes pinned to its code (STALE = verify or\n   \
+drop); `heddle gloss add <path::Symbol> \"<why>\"` pins what you learned.\n\
 \n\
 Rules that are not optional:\n\
 - With several live threads, bare verbs REFUSE rather than guess — pass\n  \
