@@ -187,6 +187,20 @@ fn tools() -> Value {
             }, "required": ["why"]},
         },
         {
+            "name": "heddle_context",
+            "description": "START HERE for a task in an unfamiliar area: returns the smallest context \
+                that lets you begin — the relevant functions/types (not whole files) with the notes \
+                earlier agents pinned to them, DEAD ENDS already tried there, signatures of what \
+                that code calls, live leases by other agents on those files, and recent commits — \
+                under a token budget. Whatever the budget cut is listed by name so you can ask for \
+                it. Local only.",
+            "inputSchema": {"type": "object", "properties": {
+                "task": {"type": "string", "description": "What you are about to do, in a sentence."},
+                "budget": {"type": "integer", "description": "Token budget (default 30000)."},
+                "repo": gloss_repo_prop.clone(),
+            }, "required": ["task"]},
+        },
+        {
             "name": "heddle_gloss_read",
             "description": "Read a file WITH the notes earlier agents pinned to it, interleaved as \
                 comments in the file's own syntax, above the code they describe. Each note says \
@@ -499,6 +513,17 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                 Err(e) => json!({"not_recorded": e}),
             };
             Ok(json!({"thread": out.thread.id, "status": "abandoned", "dead_end": recorded}).to_string())
+        }
+        "heddle_context" => {
+            let repo = gloss::Repo::open(arg(args, "repo").unwrap_or("."))?;
+            let task = arg(args, "task").ok_or("heddle_context needs `task`")?;
+            let budget = args
+                .get("budget")
+                .and_then(|v| v.as_u64())
+                .map(|b| b.clamp(1_000, 400_000) as usize)
+                .unwrap_or(heddle::context::DEFAULT_BUDGET);
+            let pack = heddle::context::build(Some(engine), &repo, &heddle::default_data_dir(), task, budget)?;
+            Ok(heddle::context::render(&pack))
         }
         g if g.starts_with("heddle_gloss_") => gloss_call(g, args),
         other => Err(format!("unknown tool: {other}")),

@@ -69,6 +69,7 @@
 
 pub mod bridge;
 pub mod consent;
+pub mod context;
 pub mod enroll;
 pub mod gloss;
 pub mod lease;

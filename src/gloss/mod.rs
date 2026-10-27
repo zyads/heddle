@@ -283,7 +283,7 @@ fn git_bytes(dir: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str
 
 /// Many objects in one `git cat-file --batch`: `None` for a missing one.
 /// Byte-exact (sizes are bytes; source files are not always UTF-8).
-fn cat_batch(repo: &Repo, specs: &[String]) -> Vec<Option<Vec<u8>>> {
+pub(crate) fn cat_batch(repo: &Repo, specs: &[String]) -> Vec<Option<Vec<u8>>> {
     if specs.is_empty() {
         return vec![];
     }
@@ -1146,6 +1146,12 @@ pub fn search(repo: &Repo, data_dir: &Path, query: &str, k: usize) -> Result<Sea
             if let Ok(vs) = e.embed_many(&texts) {
                 let mut sem: Vec<(usize, f32)> = vs.iter().enumerate().map(|(i, v)| (i, embed::cosine(&qv, v))).collect();
                 sem.sort_by(|a, b| b.1.total_cmp(&a.1));
+                // Every note has SOME cosine to any query; only near-best
+                // ones count as a semantic match, or fusion would rank all
+                // notes. Relative to the best (model-agnostic-ish), with a
+                // floor so an off-topic query matches nothing.
+                let floor = sem.first().map_or(1.0, |t| (t.1 - SEM_BAND).max(SEM_FLOOR));
+                sem.retain(|(_, c)| *c >= floor);
                 note_scores = rrf(&lex, &sem, live.len());
             }
             // Code: re-rank the lexical candidates semantically.
@@ -1177,6 +1183,11 @@ pub fn search(repo: &Repo, data_dir: &Path, query: &str, k: usize) -> Result<Sea
         .collect();
     Ok(SearchResult { notes, code, ranker, index: info, warning })
 }
+
+/// A semantic note match must be within this cosine of the best match…
+const SEM_BAND: f32 = 0.1;
+/// …and never below this (nomic-embed-text: related ≈ 0.65+, unrelated ≈ 0.45–0.52).
+const SEM_FLOOR: f32 = 0.55;
 
 /// Reciprocal rank fusion of two ranked lists over `n` items.
 fn rrf(a: &[(usize, f32)], b: &[(usize, f32)], n: usize) -> Vec<(usize, f32)> {

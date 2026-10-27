@@ -400,6 +400,19 @@ fn declaration(line: &str) -> Option<(String, bool)> {
             tail = tail.trim_start_matches('*').trim_start();
         }
         let name = ident(tail.trim_start_matches('&'))?;
+        if matches!(kw, "struct" | "enum" | "union" | "class" | "interface" | "object") {
+            // A type DEFINITION is followed by its body, generics, a tuple
+            // or a base list — not by `*p`, a variable name or `=`. Without
+            // this, C's `struct foo *p = …;` (and every parameter line of a
+            // multi-line signature) reads as a definition of `foo`.
+            let after = tail[tail.find(name).unwrap_or(0) + name.len()..].trim_start();
+            let defines = after.is_empty()
+                || after.starts_with(['{', '<', '(', ':'])
+                || ["where", "extends", "implements", "final", "sealed", "open"].iter().any(|k| after.starts_with(k));
+            if !defines {
+                return None;
+            }
+        }
         return Some((name.to_string(), container));
     }
     // JS/TS `const name = (...) =>` / `= function`.
@@ -773,6 +786,13 @@ fn main() {
         let shifted = format!("// header\n{body}");
         let r = resolve(&a, &shifted);
         assert_eq!((r.status, r.start), (Status::Moved { from: 3 }, 4), "neighbors came along: a real move");
+    }
+
+    #[test]
+    fn c_struct_uses_are_not_definitions() {
+        let c = "struct cache {\n\tint n;\n};\n\nint lookup(struct trans *t,\n\t   struct fs_info *fs, int x)\n{\n\tstruct cache *c = get(fs);\n\tif (x) {\n\t\treturn 1;\n\t}\n\treturn 0;\n}\n";
+        let p: Vec<String> = outline("x.c", c).into_iter().map(|s| format!("{}:{}-{}", s.path, s.start, s.end)).collect();
+        assert_eq!(p, vec!["cache:1-3", "lookup:5-13"]);
     }
 
     #[test]
