@@ -196,6 +196,10 @@ pub fn detect_toe_steps(rs: &RepoState, candidate: &Lease, now_ms: u64) -> Vec<T
         if other.id == candidate.id || other.expired(now_ms) {
             continue;
         }
+        // Siblings of one race overlap on purpose.
+        if candidate.race.is_some() && other.race == candidate.race {
+            continue;
+        }
         // Only leases whose thread is still live can be stepped on.
         let live = rs
             .threads
@@ -373,6 +377,7 @@ mod tests {
             holder: "t".into(),
             ttl_ms: 60_000,
             last_heartbeat_ms: 1_000,
+            race: None,
         }
     }
 

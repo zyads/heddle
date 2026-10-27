@@ -83,6 +83,15 @@ usage:
   heddle savings --record-tokens ID N           attach a real token count to
                                               thread ID; recorded ground truth
                                               replaces the estimate's assumption
+  heddle race \"<goal>\" <scope...> [--n 3]      N isolated attempts at one task (one
+                                              worktree each; siblings never
+                                              toe-step). Point an agent at each.
+  heddle race judge <race-id> [--json]          verify every attempt; winner = green,
+                                              then smallest change, then fastest
+                                              verify. Red losers become DEAD ENDS;
+                                              green losers are retired, not
+                                              blamed. The winner lands only
+                                              through the usual consent gate
   heddle heat [--by retries|time|tokens]        where agents burn effort, per symbol
        [--files] [--limit N] [--json]         (or file): red verifies, refused
                                               lands, abandons, rebases, elapsed
@@ -152,6 +161,7 @@ fn main() -> ExitCode {
         "gloss" => gloss_cli::run(rest),
         "context" => cmd_context(rest),
         "heat" => cmd_heat(rest),
+        "race" => cmd_race(rest),
         "mcp" => {
             mcp::serve(store());
             Ok(())
@@ -877,6 +887,65 @@ fn cmd_propose(rest: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_race(rest: &[String]) -> Result<(), String> {
+    let engine = store();
+    let repo = current_repo(engine)?;
+    if rest.first().map(String::as_str) == Some("judge") {
+        let race = rest.get(1).ok_or("heddle race judge <race-id>")?;
+        println!("verifying every attempt in a scratch copy (never the real tree)…");
+        let v = heddle::race::judge(engine, &repo.id, race, &holder())?;
+        if rest.iter().any(|a| a == "--json") {
+            println!("{}", serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?);
+            return Ok(());
+        }
+        for e in &v.entries {
+            let g = match e.green {
+                Some(true) => "green",
+                Some(false) => "RED",
+                None => "empty",
+            };
+            println!(
+                "  {:<28} {g:<5} {:>5} changed lines {:>6} ms  {}{}",
+                e.thread,
+                e.changed_lines,
+                e.verify_ms,
+                e.outcome,
+                e.dead_end.as_ref().map(|d| format!(" → dead end {d}")).unwrap_or_default()
+            );
+        }
+        match &v.winner {
+            Some(w) => {
+                println!("winner: {w}");
+                return cmd_propose(&["--thread".to_string(), w.clone()]);
+            }
+            None => println!("no attempt was green — nothing to land; the red ones are now dead ends"),
+        }
+        return Ok(());
+    }
+    let mut n = 3usize;
+    let mut words = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--n" {
+            n = it.next().and_then(|v| v.parse().ok()).ok_or("--n needs a number")?;
+        } else {
+            words.push(a.clone());
+        }
+    }
+    let (goal, scope) = words.split_first().ok_or("heddle race \"<goal>\" <scope...> [--n 3]")?;
+    if scope.is_empty() {
+        return Err("a race needs a scope, like a lease".into());
+    }
+    let (race, attempts) = heddle::race::start(engine, &repo.id, &holder(), goal, scope.to_vec(), n)?;
+    println!("race {race}: {n} attempts at \"{goal}\"");
+    for d in &attempts {
+        println!("  {}  WORK IN: {}", d.thread.id, d.working_dir);
+    }
+    println!("point one agent at each worktree (bare stitch/propose inside a worktree target that attempt), then:");
+    println!("  heddle race judge {race}");
+    Ok(())
 }
 
 fn cmd_heat(rest: &[String]) -> Result<(), String> {
