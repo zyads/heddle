@@ -95,6 +95,12 @@ usage:
                                               about going STALE; read a file with
                                               its notes inlined; search notes +
                                               code locally (`heddle gloss help`)
+  heddle context \"<task>\" [--budget 30k]        the smallest context to start a task:
+       [--json]                               relevant symbols with their notes,
+                                              dead ends, callee signatures, live
+                                              leases nearby, recent commits —
+                                              under a token budget, with what
+                                              was cut listed by name
   heddle mcp                                    stdio MCP server (heddle_status,
                                               heddle_lease, heddle_stitch,
                                               heddle_propose, heddle_rebase,
@@ -132,6 +138,7 @@ fn main() -> ExitCode {
         "status" => cmd_status(rest),
         "log" => cmd_log(),
         "gloss" => gloss_cli::run(rest),
+        "context" => cmd_context(rest),
         "mcp" => {
             mcp::serve(store());
             Ok(())
@@ -851,6 +858,35 @@ fn cmd_propose(rest: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_context(rest: &[String]) -> Result<(), String> {
+    let mut task = Vec::new();
+    let mut budget = heddle::context::DEFAULT_BUDGET;
+    let mut json = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--budget" => {
+                let v = it.next().ok_or("--budget needs a size, e.g. 30k")?;
+                budget = heddle::context::parse_budget(v).ok_or_else(|| format!("bad budget '{v}' (e.g. 30k, 8000)"))?;
+            }
+            "--json" => json = true,
+            other => task.push(other),
+        }
+    }
+    let task = task.join(" ");
+    if task.trim().is_empty() {
+        return Err("heddle context \"<task>\" [--budget 30k]".into());
+    }
+    let repo = heddle::gloss::Repo::open(".")?;
+    let pack = heddle::context::build(Some(store()), &repo, &heddle::default_data_dir(), &task, budget)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&pack).map_err(|e| e.to_string())?);
+    } else {
+        print!("{}", heddle::context::render(&pack));
+    }
+    Ok(())
 }
 
 fn cmd_abandon(rest: &[String]) -> Result<(), String> {

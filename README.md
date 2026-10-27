@@ -194,7 +194,8 @@ The tool flow an agent follows:
 Memory tools (work in any git repo, no `heddle init` needed):
 `heddle_gloss_read` (a file with its notes inlined), `heddle_gloss_add`,
 `heddle_gloss_search`, `heddle_gloss_why`, `heddle_gloss_verify`,
-`heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end). `heddle_propose` also takes `learned: [{target, text,
+`heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end) and `heddle_context`
+(a task's minimal context: start there). `heddle_propose` also takes `learned: [{target, text,
 kind}]`: the moment an agent knows the most is the moment it proposes.
 
 ## Gloss — memory pinned to code
@@ -279,6 +280,42 @@ like any other, so it goes STALE when the code under it changes: "tried
 against older code" is still worth knowing, and it's labeled as such.
 `Abandoned` is a terminal thread state, like `Woven`. Abandoned threads are
 never offered as orphans, and `heddle clean` removes their worktrees.
+
+### Context packs: start a task without reading whole files
+
+`heddle context "<task>" --budget 30k` (MCP: `heddle_context`) is what gloss
+memory is for. It assembles the smallest context that lets an agent start:
+
+1. **dead ends** in the files the task lands in, always first;
+2. the **relevant functions and types**, not whole files: index hits are
+   widened to the enclosing symbol that actually contains the query's
+   terms, each with its pinned notes inlined;
+3. **signatures** of what that code calls, one hop, with no bodies;
+4. **live leases** by other agents on those files;
+5. the **recent commits** that touched them.
+
+Whatever doesn't fit the budget is listed by name under "Cut by the
+budget", so the agent can ask for it; nothing is dropped silently.
+
+Measured on the Linux kernel (default 30k budget, warm). Tokens are
+estimated as chars/4. The baseline is deliberately conservative: reading
+just the top 3 files the pack draws from in full. An agent exploring with
+grep usually reads more than that.
+
+| task | pack | top 3 files in full | all cited files | smaller by | time | first symbols |
+|---|---:|---:|---:|---:|---:|---|
+| fix a lost wakeup race in try_to_wake_up | 5,873 | 83,785 | 141,488 | 14.3× | 368 ms | core.c::ttwu_queue_wakelist, ttwu_state_match, … try_to_wake_up (with its pinned invariant) |
+| page fault retry when the per-VMA lock is dropped | 6,973 | 101,061 | 176,530 | 14.5× | 373 ms | memory.c::vmf_can_call_fault, __vmf_anon_prepare, handle_pte_fault |
+| ext4 journal commit latency under fsync | 6,162 | 27,279 | 95,067 | 4.4× | 353 ms | fsync.c::ext4_fsync_journal, ext4_sync_file |
+| tcp congestion window reduction after packet loss | 4,496 | 18,177 | 82,467 | 4.0× | 307 ms | tcp.h::tcp_ca_state, then Kconfig help text |
+| usb device descriptor parsing bounds check | 5,406 | 56,934 | 114,184 | 10.5× | 301 ms | f_fs.c::ffs_entity_type, ffs_do_single_desc, ffs_do_descs |
+| btrfs extent tree reference counting bug | 6,472 | 85,716 | 85,716 | 13.2× | 274 ms | extent-tree.c::btrfs_lookup_extent_info, btrfs_inc_extent_ref |
+
+That's a median of 12× fewer tokens than opening the top three files. The
+honest miss is the TCP task: Kconfig help text outranks
+`net/ipv4/tcp_input.c`, because prose matches prose. The first run of a new
+query also embeds its candidate chunks (about 1 s), which are cached after
+that.
 
 **Why this beats memory files**
 
