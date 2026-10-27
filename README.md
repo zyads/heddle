@@ -195,8 +195,9 @@ The tool flow an agent follows:
 Memory tools (work in any git repo, no `heddle init` needed):
 `heddle_gloss_read` (a file with its notes inlined), `heddle_gloss_add`,
 `heddle_gloss_search`, `heddle_gloss_why`, `heddle_gloss_verify`,
-`heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end) and `heddle_context`
-(a task's minimal context: start there). `heddle_propose` also takes `learned: [{target, text,
+`heddle_gloss_drop`, plus `heddle_abandon` (give up and leave a dead end), `heddle_context`
+(a task's minimal context: start there) and `heddle_heat` (where effort
+went). `heddle_propose` also takes `learned: [{target, text,
 kind}]`: the moment an agent knows the most is the moment it proposes.
 
 ## Symbol leases: two agents, one file
@@ -224,6 +225,35 @@ heddle lease "rework sessions"      'src/auth.rs::Session'           # toe-step:
   in-crate). Edits that don't touch merge into the worktree, and the next
   `propose` verifies the merged file. Edits that overlap or touch stay an
   honest conflict.
+
+## Heat: where agents burn effort
+
+`heddle heat` (MCP: `heddle_heat`) ranks symbols, or files with `--files`,
+by the effort agents spent on them. It only uses what heddle observed:
+
+```
+region                                     thr retries   red  refused rebases elapsed    tokens notes
+src/util.rs::hot                             1       3     2        0       0      2s         -     1
+src/util.rs::u                               1       0     0        0       0      1s     12000     0
+```
+
+That's a real run: one thread hit two red verifies on `hot` and was
+abandoned, and another documented `u` with 12k recorded tokens. The `1`
+note on `hot` is the dead end its abandonment left behind, which is why the
+row isn't flagged `← hot, no notes`.
+
+- **retries** = red verifies + lands refused because the fabric moved +
+  abandoned threads. All of these are counted events.
+- **elapsed** = each thread's first-to-last event, summed. That's wall
+  clock and includes idle time, and the label says so.
+- **tokens** = only counts attached with `heddle savings --record-tokens`.
+  A thread's tokens are not split across the regions it touched, because
+  that would be a guess. `*` marks rows where only some threads had a count.
+- **notes** = live gloss notes on the region. A hot region with no notes is
+  where a note, or a refactor, saves the next agent the most.
+
+Threads that never stitched a change, or whose snapshots were pruned from
+heddle's bounded history, are reported as unattributed rather than dropped.
 
 ## Gloss — memory pinned to code
 

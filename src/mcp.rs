@@ -189,6 +189,19 @@ fn tools() -> Value {
             }, "required": ["why"]},
         },
         {
+            "name": "heddle_heat",
+            "description": "Where agents have burned the most effort in this repo, per symbol: red \
+                verifies, refused lands, abandoned threads, rebases, elapsed time and recorded \
+                tokens — counted from heddle's own log, never estimated — plus how many gloss \
+                notes each region has. A hot region with no notes is where a note (or a \
+                refactor) saves the next agent the most. Read-only.",
+            "inputSchema": {"type": "object", "properties": {
+                "by": {"type": "string", "enum": ["retries", "time", "tokens"]},
+                "limit": {"type": "integer"},
+                "repo": repo_prop.clone(),
+            }},
+        },
+        {
             "name": "heddle_context",
             "description": "START HERE for a task in an unfamiliar area: returns the smallest context \
                 that lets you begin — the relevant functions/types (not whole files) with the notes \
@@ -521,6 +534,17 @@ fn call(engine: &Heddle, name: &str, args: &Value) -> Result<String, String> {
                 Err(e) => json!({"not_recorded": e}),
             };
             Ok(json!({"thread": out.thread.id, "status": "abandoned", "dead_end": recorded}).to_string())
+        }
+        "heddle_heat" => {
+            let repo = repo_of(engine, args)?;
+            let by = arg(args, "by").unwrap_or("retries");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).clamp(1, 200) as usize;
+            let heat = heddle::heat::compute(engine, &repo.id, true, by)?;
+            let mut v = json!(heat);
+            if let Some(r) = v.get_mut("regions").and_then(|r| r.as_array_mut()) {
+                r.truncate(limit);
+            }
+            Ok(v.to_string())
         }
         "heddle_context" => {
             let repo = gloss::Repo::open(arg(args, "repo").unwrap_or("."))?;
